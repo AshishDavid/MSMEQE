@@ -264,15 +264,3 @@ msmeqe/
 └── tests/                  # Unit tests
 ```
 
----
-
-## Citation
-
-```bibtex
-@inproceedings{msmeqe2025,
-  title={Query Expansion as Multi-Source Constrained Optimization},
-  author={David, Ashish},
-  booktitle={Proceedings of SIGIR},
-  year={2025}
-}
-```
