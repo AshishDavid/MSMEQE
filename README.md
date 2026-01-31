@@ -1,58 +1,89 @@
 # MS-MEQE: Multi-Source Magnitude-Encoded Query Expansion
 
-This repository contains the official implementation of the paper **"Query Expansion as Multi-Source Constrained Optimization"**.
+Official implementation of **"Query Expansion as Multi-Source Constrained Optimization"** (SIGIR 2025).
 
-MS-MEQE is a query expansion framework that reformulates term selection as an **unbounded knapsack problem**. It jointly optimizes expansion across three heterogeneous sources:
+MS-MEQE reformulates query expansion as an **unbounded knapsack problem**, learning Value (benefit) and Weight (risk) functions for expansion candidates across multiple sources (RM3, Knowledge Base, Embeddings).
 
-1.  **Pseudo-Relevant Documents** (via RM3) 
-2.  **Knowledge Bases** (via Entity Linking) 
+---
 
-The system learns **Value** (benefit) and **Weight** (risk) functions for expansion candidates and dynamically predicts a query-specific expansion **Budget**.
+## Prerequisites
 
------
+### Software Requirements
 
-## 🛠 Prerequisites
+- Python 3.8+
+- Java JDK 21 (for Lucene)
 
-### Software
-
-  * **Python:** 3.8+
-  * **Java JDK:** 11+ (Required for PyJnius/Lucene interaction)
-  * **Apache Lucene:** Version 10.1.0 (JAR files)
-
-### Python Dependencies
-
-Install the required packages:
+### Install Python Dependencies
 
 ```bash
-pip install torch numpy scipy scikit-learn xgboost sentence-transformers nltk ir-datasets tqdm jnius
+pip install torch numpy scipy scikit-learn xgboost sentence-transformers nltk ir-datasets tqdm jnius joblib
 ```
 
-### External Data
+### Download Lucene JARs
 
-1.  **MS MARCO Passage Dataset:** Automatically handled via `ir_datasets`, but requires \~50GB disk space.
-2.  **Lucene JARs:** You must download the following JARs from the [Apache Lucene Archive](https://archive.apache.org/dist/lucene/java/10.1.0/) and place them in a directory (e.g., `lucene_jars/`):
-      * `lucene-core-10.1.0.jar`
-      * `lucene-analysis-common-10.1.0.jar`
-      * `lucene-queryparser-10.1.0.jar`
-      * `lucene-memory-10.1.0.jar`
-
------
-
-## 🚀 Execution Pipeline
-
-Follow these steps in exact order to reproduce the system.
-
-### Step 1: NLTK Setup
-
-Before running any scripts, ensure the WordNet corpus is downloaded for feature extraction features (Polysemy estimation).
+Download Lucene 10.1.0 from [Apache Archive](https://archive.apache.org/dist/lucene/java/10.1.0/) and extract to `lucene_jars/`:
 
 ```bash
-python3 -c "import nltk; nltk.download('wordnet')"
+mkdir lucene_jars
+# Download and place these JARs in lucene_jars/:
+#   - lucene-core-10.1.0.jar
+#   - lucene-analysis-common-10.1.0.jar
+#   - lucene-queryparser-10.1.0.jar
 ```
 
-### Step 2: Index the Collection
+### Download JDK 21
 
-Create a Lucene index for the MS MARCO collection. [cite_start]This is required for RM3 expansion and statistical feature extraction (IDF, TF)[cite: 2, 85].
+```bash
+wget https://download.java.net/java/GA/jdk21/fd2272bbf8e04c3dbaee13770090416c/35/GPL/openjdk-21_linux-x64_bin.tar.gz
+tar -xzf openjdk-21_linux-x64_bin.tar.gz
+mv jdk-21 ./jdk-21
+```
+
+---
+
+## Complete Pipeline (Step-by-Step)
+
+### Environment Setup
+
+Run these before every session:
+
+```bash
+export PYTHONPATH="$PWD:$PYTHONPATH"
+export JAVA_HOME="$PWD/jdk-21"
+export JVM_PATH="$JAVA_HOME/lib/server/libjvm.so"
+export LD_LIBRARY_PATH="$JAVA_HOME/lib/server:$LD_LIBRARY_PATH"
+```
+
+---
+
+### Step 1: Download NLTK Data
+
+```bash
+python -c "import nltk; nltk.download('wordnet')"
+```
+
+---
+
+### Step 2: Download MS MARCO Dataset
+
+This downloads train/test queries and relevance judgments (qrels):
+
+```bash
+python scripts/download_data.py
+```
+
+**Output files:**
+
+- `data/train_queries.tsv`, `data/train_queries.json`
+- `data/train_qrels.txt`
+- `data/test_queries.tsv`, `data/test_queries.json`
+- `data/test_qrels.txt`
+
+---
+
+### Step 3: Build Lucene Index
+
+Index the MS MARCO passage collection (~8.8M documents):
 
 ```bash
 python scripts/index_collection.py \
@@ -63,11 +94,13 @@ python scripts/index_collection.py \
     --ram-buffer 4096
 ```
 
-  * `--lucene-path`: Directory containing the `.jar` files downloaded in Prerequisites.
+⏱️ **Time: ~2-3 hours** | 💾 **Space: ~15 GB**
 
-### Step 3: Precompute Document Embeddings
+---
 
-[cite_start]Encode the entire document collection using Sentence-BERT for dense retrieval[cite: 83].
+### Step 4: Precompute Document Embeddings
+
+Encode all documents with Sentence-BERT for dense retrieval:
 
 ```bash
 python scripts/precompute_doc_embeddings.py \
@@ -77,15 +110,13 @@ python scripts/precompute_doc_embeddings.py \
     --model-name sentence-transformers/all-MiniLM-L6-v2
 ```
 
-  * **Note:** This step requires significant RAM. If running on a low-memory machine, reduce `--batch-size`.
+⏱️ **Time: ~4-6 hours** | 💾 **Space: ~25 GB**
 
-### Step 4: Prepare Expansion Sources
+---
 
-Prepare the vocabulary and candidates for the Embedding and Knowledge Base sources.
+### Step 5: Build SBERT Vocabulary
 
-#### 4a. Build Embedding Vocabulary ($s_{emb}$)
-
-[cite_start]Creates a vocabulary of terms and their embeddings for semantic neighbor retrieval[cite: 94].
+Create term embeddings for semantic neighbor expansion:
 
 ```bash
 python scripts/build_sbert_vocab.py \
@@ -95,56 +126,61 @@ python scripts/build_sbert_vocab.py \
     --max-terms 100000
 ```
 
-#### 4b. Precompute KB Candidates ($s_{KB}$)
+---
 
-Runs Entity Linking (WAT) on queries.
+### Step 6: Precompute KB Candidates (Optional)
 
-  * **Important:** You must obtain a WAT/TagMe API token and update `scripts/wat_entity_linker.py` or use the provided `data/kb_candidates.jsonl` if available.
-
-<!-- end list -->
+Run entity linking using WAT API:
 
 ```bash
+# First, convert queries to WAT input format
+python scripts/convert_queries_to_wat_input.py
+
+# Then run WAT entity linker (requires API token)
+python scripts/wat_entity_linker.py
+
+# Convert WAT output to KB candidates
 python scripts/precompute_kb_candidates.py \
     --topics data/train_queries.tsv \
     --wat-output data/wat_raw_output.jsonl \
-    --output data/kb_candidates.jsonl
+    --output data/kb_candidates_train.jsonl
 ```
 
-### Step 5: Generate Training Data
+> **Note:** You need a WAT/TagMe API token. Set it in `scripts/wat_entity_linker.py`.
 
-[cite_start]This script simulates the expansion process to generate "Ground Truth" data ($\Delta$MAP) for training the Value and Weight models[cite: 130].
+---
+
+### Step 7: Generate Training Data (5K Queries)
+
+Generate value/weight training data:
 
 ```bash
 python scripts/create_training_data_msmeqe.py \
     --training-queries data/train_queries.json \
     --qrels data/train_qrels.txt \
     --index-path data/msmarco_index \
-    --output-dir data/training_data \
-    --vocab-embeddings data/vocab_embeddings.pkl \
-    --kb-wat-output data/wat_raw_output.jsonl \
-    --max-queries 5000
+    --output-dir data/training_data_5k \
+    --max-queries 5000 \
+    --lucene-path ./lucene_jars
 ```
 
-### Step 6: Train MS-MEQE Models
+⏱️ **Time: ~6-12 hours**
 
-Train the regressors and the budget classifier.
+---
 
-#### 6a. Train Value and Weight Models
-
-[cite_start]Trains XGBoost regressors to predict term benefit and risk[cite: 141, 187].
+### Step 8: Train Value and Weight Models
 
 ```bash
 python scripts/train_value_weight_models.py \
-    --value-data data/training_data/value_training_data.pkl \
-    --weight-data data/training_data/weight_training_data.pkl \
+    --value-data data/training_data_5k/value_training_data.pkl \
+    --weight-data data/training_data_5k/weight_training_data.pkl \
     --output-dir models/ \
-    --n-estimators 100 \
-    --max-depth 6
+    --tune-hyperparams
 ```
 
-#### 6b. Train Budget Model
+---
 
-[cite_start]Trains a classifier to predict the optimal expansion budget ($W \in \{30, 50, 70\}$) based on query clarity and entropy[cite: 279, 289].
+### Step 9: Train Budget Model
 
 ```bash
 python scripts/train_budget_model.py \
@@ -154,12 +190,21 @@ python scripts/train_budget_model.py \
     --value-model models/value_model.pkl \
     --weight-model models/weight_model.pkl \
     --output-dir models/ \
-    --max-queries 2000
+    --max-queries 2000 \
+    --lucene-path ./lucene_jars
 ```
 
-### Step 7: Run Evaluation
+**Output models:**
 
-Run the full MS-MEQE pipeline on test queries. [cite_start]This performs candidate extraction, prediction, knapsack optimization, and dense retrieval[cite: 343].
+- `models/value_model.pkl`
+- `models/weight_model.pkl`
+- `models/budget_model.pkl`
+
+---
+
+### Step 10: Run Evaluation
+
+Evaluate on test set with MAP, nDCG, MRR:
 
 ```bash
 python scripts/run_msmeqe_evaluation.py \
@@ -171,49 +216,62 @@ python scripts/run_msmeqe_evaluation.py \
     --weight-model models/weight_model.pkl \
     --budget-model models/budget_model.pkl \
     --emb-vocab data/vocab_embeddings.pkl \
-    --kb-candidates data/kb_candidates_test.jsonl \
     --output runs/msmeqe_results.txt \
-    --run-name MS-MEQE-Run1
+    --run-name MS-MEQE \
+    --log-per-query results/per_query_stats.jsonl
 ```
 
------
+**Metrics reported:**
 
-## 📂 Repository Structure
+- `MAP` - Mean Average Precision
+- `nDCG@10`, `nDCG@20` - Normalized Discounted Cumulative Gain
+- `MRR` - Mean Reciprocal Rank
+- `Recall@100`, `Recall@1000`
+- `P@10`, `P@20` - Precision
 
-```text
-.
-├── data/                       # Data storage (indices, embeddings, training data)
-├── models/                     # Saved XGBoost models
-├── lucene_jars/                # External Lucene 10.1.0 dependencies
-├── scripts/                    # Executable scripts
+---
+
+## Quick Start (All-in-One Script)
+
+For convenience, after setup you can run the full training pipeline:
+
+```bash
+# Run everything (Steps 7-9)
+./scripts/train_10k.sh
+```
+
+---
+
+## Repository Structure
+
+```
+msmeqe/
+├── src/                    # Core source code
+│   ├── expansion/          # Candidate extraction & knapsack logic
+│   ├── features/           # Feature extraction
+│   ├── models/             # Budget predictor
+│   ├── reranking/          # Semantic encoders
+│   ├── retrieval/          # BM25 & evaluation
+│   └── utils/              # Lucene utils, knapsack solver
+├── scripts/                # Executable scripts
+│   ├── download_data.py
 │   ├── index_collection.py
 │   ├── precompute_doc_embeddings.py
-│   ├── build_sbert_vocab.py
 │   ├── create_training_data_msmeqe.py
 │   ├── train_value_weight_models.py
 │   ├── train_budget_model.py
 │   └── run_msmeqe_evaluation.py
-└── src/                        # Core source code
-    ├── expansion/              # Candidate extraction & optimization logic
-    │   ├── candidate_extraction_pipeline.py
-    │   ├── msmeqe_expansion.py # Core Knapsack & Magnitude Encoding logic
-    │   ├── rm_expansion.py     # Lucene RM3 implementation
-    │   └── ...
-    ├── features/               # Feature engineering
-    │   └── feature_extraction.py
-    ├── reranking/              # Semantic encoders
-    ├── retrieval/              # BM25 & Evaluation utils
-    └── utils/                  # Knapsack solver, file utils, etc.
+└── tests/                  # Unit tests
 ```
 
-## 📜 Citation
+---
 
-If you use this code, please cite the original paper:
+## Citation
 
 ```bibtex
 @inproceedings{msmeqe2025,
   title={Query Expansion as Multi-Source Constrained Optimization},
-  author={Unknown},
+  author={David, Ashish},
   booktitle={Proceedings of SIGIR},
   year={2025}
 }

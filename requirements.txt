@@ -1,4 +1,22 @@
-ir-datasets
-joblib
-tqdm
+# Core ML/DL
+torch
 numpy
+scipy
+scikit-learn
+xgboost
+
+# NLP & Embeddings
+sentence-transformers
+transformers
+nltk
+huggingface-hub
+
+# IR Datasets
+ir_datasets
+
+# Java/Lucene Bridge
+pyjnius
+
+# Utilities
+tqdm
+joblib
