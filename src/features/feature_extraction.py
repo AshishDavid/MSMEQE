@@ -4,8 +4,8 @@
 Feature Extraction for MS-MEQE
 
 Implements the feature extraction described in Sections 3.3-3.4 of the paper:
-  - Value features (18 features): semantic, statistical, query-term interaction,
-    retrieval-theoretic, source-specific
+  - Value features (19 features): semantic, statistical, query-term interaction,
+    retrieval-theoretic, source-specific, LLM-specific
   - Weight features (20 features): drift, ambiguity, source risk
   - Query features (10 features): for budget prediction
 
@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 from typing import List, Dict, Optional, Set, Tuple
 from dataclasses import dataclass
+from collections import Counter
 
 import numpy as np
 
@@ -41,7 +42,7 @@ class FeatureExtractor:
     Extract features for value/weight prediction and budget allocation.
 
     Implements the feature sets described in the paper:
-      - Section 3.3.1: Value features (18 features)
+      - Section 3.3.1: Value features (19 features)
       - Section 3.4.1: Weight features (20 features)
       - Section 3.6.1: Query features (10 features)
 
@@ -160,7 +161,7 @@ class FeatureExtractor:
             pseudo_centroid: Centroid of pseudo-relevant docs (d,) or None
 
         Returns:
-            Feature vector of shape (18,)
+            Feature vector of shape (19,)
         """
         features = []
 
@@ -220,12 +221,17 @@ class FeatureExtractor:
         # Normalize rank (lower rank = better)
         native_rank_norm = 1.0 / (native_rank + 1.0) if native_rank > 0 else 0.0
 
+        # === CROSS-SOURCE AGREEMENT (1) ===
+        agreement_count = candidate_stats.get('agreement_count', 1.0)
+        
         features.extend([
             source_docs,
             source_kb,
             source_emb,
             native_rank_norm,
             native_score,
+            1.0 if candidate_source == "llm" else 0.0, # is_llm_entity
+            float(agreement_count),  # Re-enabled: Measures cross-source consensus
         ])
 
         return np.array(features, dtype=np.float32)
@@ -416,16 +422,23 @@ class FeatureExtractor:
             pseudo_centroid: Pseudo-doc centroid (d,) or None
 
         Returns:
-            Feature matrix of shape (m, 18)
+            Feature matrix of shape (m, 20)
         """
         m = len(candidates)
         features_list = []
 
+        # Count occurrences of each term across all candidates
+        term_counts = Counter([c[0].lower() for c in candidates])
+
         for i, (term, source, stats) in enumerate(candidates):
+            # Add agreement count to stats for the single-term extractor
+            stats_with_count = stats.copy()
+            stats_with_count['agreement_count'] = term_counts.get(term.lower(), 1)
+            
             feat = self.extract_value_features(
                 candidate_term=term,
                 candidate_source=source,
-                candidate_stats=stats,
+                candidate_stats=stats_with_count,
                 query_text=query_text,
                 query_embedding=query_embedding,
                 term_embedding=term_embeddings[i],
@@ -433,7 +446,8 @@ class FeatureExtractor:
             )
             features_list.append(feat)
 
-        return np.vstack(features_list) if features_list else np.zeros((0, 18), dtype=np.float32)
+        # Note: Dimension is now 20 because of the extra agreement feature
+        return np.vstack(features_list) if features_list else np.zeros((0, 20), dtype=np.float32)
 
     def extract_weight_features_batch(
             self,
@@ -787,6 +801,14 @@ class FeatureExtractor:
             'first', 'well', 'way', 'even', 'new', 'want', 'because',
             'any', 'these', 'give', 'day', 'most', 'us', 'is', 'was',
             'are', 'been', 'has', 'had', 'were', 'said', 'did', 'having',
+            'also', 'each', 'many', 'much', 'some', 'very', 'too', 'than',
+            'just', 'only', 'both', 'each', 'any', 'such', 'this', 'that',
+            'these', 'those', 'same', 'different', 'another', 'other',
+            'within', 'between', 'during', 'before', 'after', 'above',
+            'below', 'around', 'about', 'across', 'through', 'toward',
+            'along', 'among', 'behind', 'against', 'near', 'far',
+            'common', 'usually', 'typically', 'often', 'frequently',
+            'always', 'never', 'sometimes', 'nearly', 'almost',
         }
 
 

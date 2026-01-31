@@ -7,7 +7,7 @@ import argparse
 import joblib
 import sys
 
-MY_GCUBE_TOKEN = "8775ecea-90d0-4fca-89d3-e19c0790489f-843339462"
+MY_GCUBE_TOKEN = "75912338-e3ac-4680-94a7-697397d400e3-843339462"
 
 
 @contextlib.contextmanager

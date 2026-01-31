@@ -159,3 +159,71 @@ Desktop.ini
 *~
 .directory
 .Trash-*
+
+# ===========================================
+# MS-MEQE Research Project Exclusions
+# ===========================================
+
+# Data directories (precomputed indices, embeddings, training data)
+data/
+results/
+best_result_reproduction/
+breakthrough_results/
+
+# Run outputs
+runs/
+
+# Trained models (users should train from scratch)
+models/
+models_*/
+
+# External dependencies (users should download separately)
+jdk-*/
+lucene-*/
+lucene_jars/
+openjdk-*.tar.gz
+*.tgz
+
+# Large dataset files
+*.jsonl
+robust04*.jsonl
+trec_robust04_*.tsv
+
+# Log files (all .log files)
+*.log
+
+# Debug and analysis output files
+debug_*.txt
+analysis_*.txt
+evaluation_*.txt
+evaluation_*.json
+*_per_query.jsonl
+verify_*.jsonl
+diagnostic_*.txt
+trace_*.txt
+final_*.txt
+complete_log.txt
+advanced_oracle_metrics.txt
+temp_screen_output
+
+# Java error logs
+hs_err_pid*.log
+
+# LaTeX paper files (not part of code release)
+*.tex
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+
+# Miscellaneous generated files
+*.pkl
+*.pt
+*.bin
+*.npy
+
+# Report files (keep README.md)
+*_REPORT.md
+*_report.md

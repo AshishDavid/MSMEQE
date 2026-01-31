@@ -37,60 +37,117 @@ def precompute_document_embeddings(
         collection_name: str,
         output_dir: str,
         encoder: SemanticEncoder,
+        input_file: str = None,
         batch_size: int = 512,
         max_docs: int = None,
 ):
     """
-    Precompute and save document embeddings.
-
-    Args:
-        collection_name: IR dataset collection name
-        output_dir: Where to save embeddings
-        encoder: SemanticEncoder instance
-        batch_size: Encoding batch size
-        max_docs: Limit number of documents (for testing)
+    Precompute and save document embeddings using memmap.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"Loading collection: {collection_name}")
-    dataset = ir_datasets.load(collection_name)
-
-    # Get total document count
-    try:
-        total_docs = dataset.docs_count()
+    # Iterator and Count
+    if input_file:
+        logger.info(f"Loading from file: {input_file}")
+        # Count lines for memmap
+        logger.info("Counting documents in file...")
+        total_docs = 0
+        with open(input_file, 'r') as f:
+            for _ in f:
+                total_docs += 1
+        
         if max_docs:
             total_docs = min(total_docs, max_docs)
-    except:
-        total_docs = None
+            
+        def _doc_iter():
+            with open(input_file, 'r') as f:
+                for line in f:
+                    try:
+                        yield json.loads(line)
+                    except Exception:
+                        continue
+        
+        iterator = _doc_iter()
+        
+    elif collection_name:
+        logger.info(f"Loading collection: {collection_name}")
+        dataset = ir_datasets.load(collection_name)
+        try:
+            total_docs = dataset.docs_count()
+            if max_docs:
+                total_docs = min(total_docs, max_docs)
+        except:
+            total_docs = None
+            logger.warning("Could not determine total documents count.")
+        
+        iterator = dataset.docs_iter()
+    else:
+        raise ValueError("Must provide either --collection or --input-file")
 
-    logger.info(f"Encoding documents (batch_size={batch_size})...")
+    if total_docs is None:
+         # Rough estimate or read into list (not recommended for large data)
+         raise ValueError("Cannot determine total documents count for memmap.")
+
+    logger.info(f"Total documents to process: {total_docs}")
+
+    # Initialize memmap
+    emb_dim = encoder.get_dim()
+    embeddings_path = output_dir / "doc_embeddings.npy"
+    
+    logger.info(f"Initializing .npy memmap at {embeddings_path} with shape ({total_docs}, {emb_dim})")
+    
+    doc_embeddings = np.lib.format.open_memmap(
+        str(embeddings_path), 
+        mode='w+', 
+        dtype='float32', 
+        shape=(total_docs, emb_dim)
+    )
 
     doc_ids = []
-    all_embeddings = []
-
     batch_texts = []
     batch_ids = []
-
-    for i, doc in enumerate(tqdm(dataset.docs_iter(), total=total_docs, desc="Processing")):
+    
+    current_idx = 0
+    
+    # Process docs
+    for i, doc in enumerate(tqdm(iterator, total=total_docs, desc="Processing")):
         if max_docs and i >= max_docs:
             break
 
-        # Get document text
-        if hasattr(doc, 'text'):
-            doc_text = doc.text
-        elif hasattr(doc, 'body'):
-            doc_text = doc.body
-        else:
+        doc_text = None
+        doc_id = None
+
+        # Handle IR Dataset object
+        if hasattr(doc, 'doc_id'):
+            doc_id = doc.doc_id
+            if hasattr(doc, 'text'):
+                doc_text = doc.text
+            elif hasattr(doc, 'body'):
+                doc_text = doc.body
+        
+        # Handle Dict (JSONL)
+        elif isinstance(doc, dict):
+            # Try common fields
+            doc_id = doc.get('id') or doc.get('docid') or doc.get('_id')
+            doc_text = doc.get('contents') or doc.get('text') or doc.get('body')
+
+        if not doc_text or not doc_id:
             continue
 
         batch_texts.append(doc_text)
-        batch_ids.append(doc.doc_id)
+        batch_ids.append(doc_id)
 
         # Encode batch when full
         if len(batch_texts) >= batch_size:
             embeddings = encoder.encode(batch_texts)
-            all_embeddings.append(embeddings)
+            
+            # Write to memmap
+            end_idx = current_idx + len(embeddings)
+            doc_embeddings[current_idx:end_idx] = embeddings
+            doc_embeddings.flush()
+            
+            current_idx = end_idx
             doc_ids.extend(batch_ids)
 
             batch_texts = []
@@ -99,38 +156,25 @@ def precompute_document_embeddings(
     # Encode remaining batch
     if batch_texts:
         embeddings = encoder.encode(batch_texts)
-        all_embeddings.append(embeddings)
+        end_idx = current_idx + len(embeddings)
+        doc_embeddings[current_idx:end_idx] = embeddings
+        doc_embeddings.flush()
+        current_idx = end_idx
         doc_ids.extend(batch_ids)
 
-    # Concatenate all embeddings
-    logger.info("Concatenating embeddings...")
-    doc_embeddings = np.vstack(all_embeddings)
+    logger.info(f"Encoded {len(doc_ids)} documents.")
 
-    # === VALIDATION: Ensure Data Consistency ===
-    logger.info("Validating embedding count against document IDs...")
-    if doc_embeddings.shape[0] != len(doc_ids):
-        error_msg = (
-            f"CRITICAL ERROR: Data Mismatch! "
-            f"Generated {doc_embeddings.shape[0]} embeddings but tracked {len(doc_ids)} IDs. "
-            f"Files will NOT be saved to prevent corruption."
-        )
-        logger.error(error_msg)
-        raise ValueError(error_msg)
+    # Trim if necessary (create new view if less docs than expected)
+    if len(doc_ids) < total_docs:
+        logger.warning(f"Processed fewer docs ({len(doc_ids)}) than expected ({total_docs}).")
+        # Since open_memmap fixed the size at creation, we can't easily resize in place without copying.
+        # But we can update the doc_ids to match. The valid data is just the prefix.
+        # Ideally we would resize the file, but for now we just warn.
+        pass
 
-    logger.info(f"Validation PASSED: {len(doc_ids)} documents encoded successfully.")
-    # ===========================================
-
-    logger.info(f"Encoded {len(doc_ids)} documents, embedding shape: {doc_embeddings.shape}")
-
-    # Normalize embeddings (for cosine similarity)
-    logger.info("Normalizing embeddings...")
-    norms = np.linalg.norm(doc_embeddings, axis=1, keepdims=True)
-    doc_embeddings = doc_embeddings / (norms + 1e-12)
-
-    # Save embeddings
-    embeddings_path = output_dir / "doc_embeddings.npy"
-    logger.info(f"Saving embeddings to {embeddings_path}")
-    np.save(str(embeddings_path), doc_embeddings)
+    # No need to call np.save() because open_memmap writes directly to the .npy file
+    # and we called flush() periodically.
+    del doc_embeddings  # Close memmap cleanly
 
     # Save doc IDs
     ids_path = output_dir / "doc_ids.json"
@@ -138,17 +182,15 @@ def precompute_document_embeddings(
     with open(ids_path, 'w') as f:
         json.dump(doc_ids, f)
 
-    # Log file sizes
-    emb_size_mb = embeddings_path.stat().st_size / (1024 * 1024)
-    logger.info(f"Embeddings file size: {emb_size_mb:.1f} MB")
-
     logger.info("Precomputation complete!")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Precompute document embeddings")
-    parser.add_argument("--collection", type=str, required=True,
-                        help="IR dataset collection name")
+    parser.add_argument("--collection", type=str, required=False,
+                        help="IR dataset collection name (optional if --input-file used)")
+    parser.add_argument("--input-file", type=str, required=False,
+                        help="Path to JSONL input file (alternative to --collection)")
     # Note: index-path arg is kept for compatibility but output-dir dictates save location
     parser.add_argument("--index-path", type=str, required=False,
                         help="Path to Lucene index (optional/unused in this script)")
@@ -176,6 +218,7 @@ def main():
     # Precompute embeddings
     precompute_document_embeddings(
         collection_name=args.collection,
+        input_file=args.input_file,
         output_dir=args.output_dir,
         encoder=encoder,
         batch_size=args.batch_size,

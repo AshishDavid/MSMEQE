@@ -4,7 +4,7 @@ import os
 from typing import Dict, List, Tuple, Any, Optional
 from collections import defaultdict
 import ir_datasets
-from src.evaluation.metrics import get_metric
+from src.retrieval.metrics import get_metric
 
 logger = logging.getLogger(__name__)
 

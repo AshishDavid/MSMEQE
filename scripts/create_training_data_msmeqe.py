@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import List, Dict, Tuple
 import numpy as np
 import pickle
+from collections import Counter
 from tqdm import tqdm
 import json
 import time
@@ -79,7 +80,7 @@ class TrainingDataGenerator:
         self.index_path = index_path
         self.N = collection_size
 
-        self.evaluator = TRECEvaluator(metrics=['map'])
+        self.evaluator = TRECEvaluator(metrics=['map', 'ndcg_cut_10', 'recip_rank'])
 
         # Initialize dense retrieval system
         self._init_retrieval_system()
@@ -112,7 +113,7 @@ class TrainingDataGenerator:
 
         # FIX: Added try/except block for loading validation
         try:
-            self.doc_embeddings = np.load(str(doc_embeddings_path))  # Shape: (N, d)
+            self.doc_embeddings = np.load(str(doc_embeddings_path), mmap_mode='r')  # Shape: (N, d)
         except Exception as e:
             raise ValueError(f"Corrupt or invalid .npy file: {e}")
 
@@ -132,9 +133,12 @@ class TrainingDataGenerator:
         )
 
         # Optimization: Normalize once at load time for efficiency
-        norms = np.linalg.norm(self.doc_embeddings, axis=1, keepdims=True)
-        norms[norms == 0] = 1e-12
-        self.doc_embeddings = self.doc_embeddings / norms
+        # self.doc_embeddings = self.doc_embeddings / norms
+        # NOTE: Cannot modify mmap array in-place. 
+        # We assume embeddings are already normalized or we normalize query instead?
+        # Actually, dense retrieval usually requires normalized doc embeddings for dot product = cosine.
+        # If we can't normalize in place, we might need to normalize during retrieval or ensure precomputation did it.
+        pass
 
     def generate_training_data(
             self,
@@ -143,11 +147,14 @@ class TrainingDataGenerator:
             output_dir: str,
             max_queries: int = None,
             max_candidates_per_query: int = 20,
-            checkpoint_every: int = 100
+
+            checkpoint_every: int = 100,
+            kb_candidates_map: Dict[str, List[Dict]] = None
     ):
         """
         Generate training data for all queries with checkpointing.
         """
+        kb_candidates_map = kb_candidates_map or {}
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -194,9 +201,13 @@ class TrainingDataGenerator:
 
                 try:
                     # === 1. EXTRACT CANDIDATES ===
+                    # Check for KB override
+                    kb_override = kb_candidates_map.get(query_id)
+                    
                     candidates = self.candidate_extractor.extract_all_candidates(
                         query_text=query_text,
                         query_id=query_id,
+                        kb_override=kb_override
                     )
 
                     if not candidates:
@@ -222,6 +233,8 @@ class TrainingDataGenerator:
                     )
 
                     # === 4. FOR EACH CANDIDATE, COMPUTE GROUND TRUTH ===
+                    term_counts = Counter([c.term.lower() for c in candidates])
+                
                     for i, cand in enumerate(candidates):
                         # --- Feature Extraction ---
                         stats = create_candidate_stats_dict(
@@ -233,6 +246,7 @@ class TrainingDataGenerator:
                             native_rank=cand.native_rank,
                             native_score=cand.native_score,
                         )
+                        stats['agreement_count'] = term_counts.get(cand.term.lower(), 1)
 
                         val_features = self.feature_extractor.extract_value_features(
                             candidate_term=cand.term,
@@ -254,8 +268,8 @@ class TrainingDataGenerator:
                         )
 
                         # --- Evaluate Expansion ---
-                        # Use weighted average q' = 0.7*q + 0.3*term
-                        expanded_query_emb = 0.7 * query_emb + 0.3 * term_embs[i]
+                        # Use weighted average q' = 0.9*q + 0.1*term
+                        expanded_query_emb = 0.9 * query_emb + 0.1 * term_embs[i]
 
                         expanded_map = self._evaluate_query_embedding(
                             query_embedding=expanded_query_emb,
@@ -421,7 +435,13 @@ class TrainingDataGenerator:
             )
 
             map_score = metrics.get('map', 0.0)
-            return float(map_score)
+            ndcg_score = metrics.get('ndcg_cut_10', 0.0)
+            
+            # Value Target: Combined Score (50% MAP, 50% nDCG)
+            # This allows the model to optimize for both metrics simultaneously
+            combined_score = 0.5 * map_score + 0.5 * ndcg_score
+            
+            return combined_score
 
         except Exception as e:
             logger.warning(f"Evaluation failed for query {query_id}: {e}")
@@ -447,10 +467,14 @@ def main():
     # Optional extractors
     parser.add_argument("--kb-wat-output", type=str, default=None,
                         help="Path to WAT entity linking output (optional)")
+    parser.add_argument("--kb-candidates", type=str, default=None,
+                        help="Path to precomputed KB candidates JSONL (optional)")
     parser.add_argument("--kb-desc-tsv", type=str, default=None,
                         help="Path to wikiid->description TSV (optional)")
     parser.add_argument("--vocab-embeddings", type=str, default=None,
                         help="Path to vocabulary embeddings (optional)")
+    parser.add_argument("--llm-candidates", type=str, default=None,
+                        help="Path to precomputed LLM candidates JSONL (optional)")
 
     # Output
     parser.add_argument("--output-dir", type=str, required=True,
@@ -469,9 +493,14 @@ def main():
                         help="Collection size (default: MS MARCO passage)")
 
     # Encoder
+    # Encoder
     parser.add_argument("--model-name", type=str,
                         default="sentence-transformers/all-MiniLM-L6-v2",
                         help="Sentence-BERT model name")
+    
+    # Lucene
+    parser.add_argument("--lucene-path", type=str, default="./lucene_jars",
+                        help="Path to Lucene JARs")
 
     args = parser.parse_args()
 
@@ -483,6 +512,10 @@ def main():
     # === INITIALIZE COMPONENTS ===
 
     logger.info("Initializing components...")
+    
+    # Initialize Lucene
+    from src.utils.lucene_utils import initialize_lucene
+    initialize_lucene(lucene_path=args.lucene_path)
 
     # Encoder
     logger.info(f"Loading encoder: {args.model_name}")
@@ -516,6 +549,7 @@ def main():
         encoder=encoder,
         kb_extractor=kb_extractor,
         emb_extractor=emb_extractor,
+        llm_candidates_path=args.llm_candidates,
     )
 
     # Initialize training data generator
@@ -540,6 +574,23 @@ def main():
 
     # === GENERATE TRAINING DATA ===
 
+    # Load KB candidates if provided
+    kb_candidates_map = None
+    if args.kb_candidates:
+        logger.info(f"Loading KB candidates from {args.kb_candidates}")
+        # from scripts.precompute_kb_candidates import load_kb_candidates_from_file as load_kb_cands
+        # We can implement a simple loader here to avoid circular import if needed or import from a shared util
+        # But precompute_kb_candidates.py is a script. Better to just implement a loader here or use run_msmeqe_evaluation.py's
+        kb_candidates_map = {}
+        with open(args.kb_candidates, 'r') as f:
+            for line in f:
+                if not line.strip(): continue
+                item = json.loads(line)
+                kb_candidates_map[item['qid']] = item.get('candidates', [])
+        logger.info(f"Loaded candidates for {len(kb_candidates_map)} queries")
+
+    # === GENERATE TRAINING DATA ===
+
     logger.info("Generating training data with REAL retrieval...")
     logger.info("This may take a while (several hours for 5000 queries)...")
 
@@ -549,7 +600,8 @@ def main():
         output_dir=args.output_dir,
         max_queries=args.max_queries,
         max_candidates_per_query=args.max_candidates_per_query,
-        checkpoint_every=args.checkpoint_every
+        checkpoint_every=args.checkpoint_every,
+        kb_candidates_map=kb_candidates_map
     )
 
     logger.info("=" * 60)

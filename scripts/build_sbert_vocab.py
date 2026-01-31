@@ -176,6 +176,7 @@ class VocabularyBuilder:
     def build_from_index(
             self,
             index_path: str,
+            lucene_path: str,
             field: str = "contents",
             min_df: int = 5,
             max_df_ratio: float = 0.5,
@@ -192,6 +193,7 @@ class VocabularyBuilder:
 
         Args:
             index_path: Path to Lucene index
+            lucene_path: Path to Lucene JARs
             field: Field name to extract terms from
             min_df: Minimum document frequency
             max_df_ratio: Maximum document frequency ratio (to filter stop words)
@@ -204,13 +206,15 @@ class VocabularyBuilder:
         logger.info(f"Field: {field}, min_df: {min_df}, max_df_ratio: {max_df_ratio}")
 
         # Initialize Lucene
+        from src.utils.lucene_utils import initialize_lucene
+        initialize_lucene(lucene_path=lucene_path)
         classes = get_lucene_classes()
 
         DirectoryReader = classes['IndexReader']
         FSDirectory = classes['FSDirectory']
-        Path = classes['Path']
+        JavaPaths = classes['JavaPaths']
 
-        directory = FSDirectory.open(Path.get(index_path))
+        directory = FSDirectory.open(JavaPaths.get(index_path))
         reader = DirectoryReader.open(directory)
 
         num_docs = reader.numDocs()
@@ -219,43 +223,42 @@ class VocabularyBuilder:
         logger.info(f"Index: {num_docs} documents, max_df: {max_df}")
 
         # Extract terms
-        logger.info("Extracting terms from index...")
-        terms_with_df = []
+        logger.info("Extracting terms from index (iterating leaves)...")
+        term_df_map = {}
 
-        terms = reader.terms(field)
-        if terms is None:
-            raise ValueError(f"Field '{field}' not found in index")
-
-        terms_enum = terms.iterator()
-
-        count = 0
-        while terms_enum.next():
-            term_bytes = terms_enum.term()
-            try:
-                term_text = term_bytes.utf8ToString()
-
-                # FIX: Handle multi-word terms typically stored with underscores
-                # e.g., "neural_network" -> "neural network"
-                if '_' in term_text:
-                    term_text = term_text.replace('_', ' ')
-
-                term_text = term_text.strip()
-                if not term_text:
-                    continue
-
-            except Exception as e:
-                # Skip invalid utf-8 sequences
+        leaves = reader.leaves()
+        for leaf_ctx in leaves:
+            leaf_reader = leaf_ctx.reader()
+            terms = leaf_reader.terms(field)
+            if terms is None:
                 continue
+            
+            terms_enum = terms.iterator()
+            while terms_enum.next():
+                term_bytes = terms_enum.term()
+                try:
+                    term_text = term_bytes.utf8ToString()
 
-            df = terms_enum.docFreq()
+                    # FIX: Handle multi-word terms typically stored with underscores
+                    if '_' in term_text:
+                        term_text = term_text.replace('_', ' ')
 
+                    term_text = term_text.strip()
+                    if not term_text:
+                        continue
+
+                    df = terms_enum.docFreq()
+                    term_df_map[term_text] = term_df_map.get(term_text, 0) + df
+
+                except Exception:
+                    continue
+        
+        # Filter by DF criteria
+        terms_with_df = []
+        for term_text, df in term_df_map.items():
             if min_df <= df <= max_df:
                 terms_with_df.append((term_text, df))
-                count += 1
-
-                if count % 10000 == 0:
-                    logger.info(f"  Extracted {count} terms...")
-
+        
         logger.info(f"Extracted {len(terms_with_df)} terms matching criteria")
 
         # Sort by DF (descending)
@@ -453,6 +456,12 @@ def main():
 
     # Index-specific options
     parser.add_argument(
+        "--lucene-path",
+        type=str,
+        default="./lucene_jars",
+        help="Path to Lucene JARs (for index mode)",
+    )
+    parser.add_argument(
         "--field",
         type=str,
         default="contents",
@@ -470,8 +479,6 @@ def main():
         default=0.5,
         help="Maximum DF ratio (to filter stop words) for index mode",
     )
-
-    # Encoding
     parser.add_argument(
         "--batch-size",
         type=int,
@@ -513,6 +520,7 @@ def main():
         logger.info(f"Source: Lucene index ({args.from_index})")
         vocab = builder.build_from_index(
             index_path=args.from_index,
+            lucene_path=args.lucene_path,
             field=args.field,
             min_df=args.min_df,
             max_df_ratio=args.max_df_ratio,

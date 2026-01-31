@@ -39,7 +39,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from msmeqe.reranking.semantic_encoder import SemanticEncoder
+from src.reranking.semantic_encoder import SemanticEncoder
 
 logger = logging.getLogger(__name__)
 

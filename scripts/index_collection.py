@@ -217,8 +217,12 @@ class LuceneIndexer:
         self.IndexWriterConfig = classes['IndexWriterConfig']
         self.FSDirectory = classes['FSDirectory']
         self.JavaPaths = classes['JavaPaths']
+        self.JString = classes['JString']
+        self.BytesRef = classes['BytesRef']
+        self.StringReader = classes['StringReader']
         self.Document = classes['Document']
         self.Field = classes['Field']
+        self.FieldStore = classes['FieldStore']
         self.FieldType = classes['FieldType']
         self.StringField = classes['StringField']
         self.TextField = classes['TextField']
@@ -282,6 +286,7 @@ class LuceneIndexer:
         Returns:
             Number of documents indexed
         """
+        from jnius import cast
         logger.info("Starting indexing...")
 
         count = 0
@@ -305,11 +310,18 @@ class LuceneIndexer:
                 # Create document
                 doc = self.Document()
 
-                # Add docid field (stored, not indexed)
-                doc.add(self.StringField("docid", docid, self.Field.Store.YES))
+                # Add docid field (stored, not indexed) (Field name MUST be 'id' for Pyserini/Standard tools)
+                # Parse as JString to ensure correct constructor usage
+                jdocid = self.JString(docid)
+                doc.add(self.StringField("id", jdocid, self.FieldStore.YES))
 
                 # Add text field with custom FieldType
-                contents_field = self.Field(field_name, text, contents_field_type)
+                # Cast FieldType to IndexableFieldType to help PyJnius select the right constructor
+                jfield_name = self.JString(field_name)
+                jtext = self.JString(text)
+                jtext_cs = cast('java.lang.CharSequence', jtext)
+                jtype = cast('org.apache.lucene.index.IndexableFieldType', contents_field_type)
+                contents_field = self.Field(jfield_name, jtext_cs, jtype)
                 doc.add(contents_field)
 
                 # Add to index

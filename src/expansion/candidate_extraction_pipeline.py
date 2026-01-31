@@ -40,6 +40,7 @@ import logging
 from typing import List, Dict, Optional, Tuple, Any
 from collections import Counter
 import re
+import json
 import numpy as np
 
 from src.expansion.rm_expansion import LuceneRM3Scorer
@@ -67,6 +68,7 @@ class MultiSourceCandidateExtractor:
             n_kb: int = 30,
             n_emb: int = 30,
             n_pseudo_docs: int = 10,
+            llm_candidates_path: Optional[str] = None,
     ):
         """
         Initialize multi-source extractor.
@@ -81,6 +83,7 @@ class MultiSourceCandidateExtractor:
             field="contents",
             mu=1000.0,
             orig_query_weight=0.5,
+            analyzer="EnglishAnalyzer"
         )
 
         # Store extractors
@@ -95,6 +98,52 @@ class MultiSourceCandidateExtractor:
         # Initialize Lucene for term statistics
         self._init_lucene_stats()
 
+        # Load LLM candidates if provided
+        self.llm_cache = {}
+        if llm_candidates_path:
+            logger.info(f"Loading LLM candidates from {llm_candidates_path}")
+            try:
+                with open(llm_candidates_path, 'r') as f:
+                    for line in f:
+                        data = json.loads(line)
+                        qid = data.get('qid') or str(data.get('id', ''))
+                        if qid:
+                            self.llm_cache[str(qid)] = data
+                logger.info(f"Loaded {len(self.llm_cache)} LLM candidate records")
+            except Exception as e:
+                logger.warning(f"Failed to load LLM candidates: {e}")
+
+        # Broadened stopword list
+        self.stopwords = {
+            'the', 'be', 'to', 'of', 'and', 'a', 'in', 'that', 'have',
+            'i', 'it', 'for', 'not', 'on', 'with', 'he', 'as', 'you',
+            'do', 'at', 'this', 'but', 'his', 'by', 'from', 'they',
+            'we', 'say', 'her', 'she', 'or', 'an', 'will', 'my', 'one',
+            'all', 'would', 'there', 'their', 'what', 'so', 'up', 'out',
+            'if', 'about', 'who', 'get', 'which', 'go', 'me', 'when',
+            'make', 'can', 'like', 'time', 'no', 'just', 'him', 'know',
+            'take', 'people', 'into', 'year', 'your', 'good', 'some',
+            'could', 'them', 'see', 'other', 'than', 'then', 'now',
+            'look', 'only', 'come', 'its', 'over', 'think', 'also',
+            'back', 'after', 'use', 'two', 'how', 'our', 'work',
+            'first', 'well', 'way', 'even', 'new', 'want', 'because',
+            'any', 'these', 'give', 'day', 'most', 'us', 'is', 'was',
+            'are', 'been', 'has', 'had', 'were', 'said', 'did', 'having',
+            'do', 'does', 'doing', 'done', 'am', 'is', 'are', 'was', 'were',
+            'be', 'been', 'being', 'have', 'has', 'had', 'having',
+            'shall', 'will', 'should', 'would', 'can', 'could', 'may', 'might', 'must',
+            'also', 'each', 'many', 'much', 'some', 'very', 'too', 'than',
+            'just', 'only', 'both', 'each', 'any', 'such', 'this', 'that',
+            'these', 'those', 'same', 'different', 'another', 'other',
+            'within', 'between', 'during', 'before', 'after', 'above',
+            'below', 'around', 'about', 'across', 'through', 'toward',
+            'along', 'among', 'behind', 'against', 'near', 'far',
+            'common', 'usually', 'typically', 'often', 'frequently',
+            'always', 'never', 'sometimes', 'nearly', 'almost',
+            'includes', 'including', 'included', 'example', 'examples', 'like',
+            'why', 'where', 'whose', 'whom',
+        }
+
         logger.info(
             f"Initialized MultiSourceCandidateExtractor: "
             f"RM3={n_docs_rm3}, KB={n_kb}, Emb={n_emb}"
@@ -107,7 +156,8 @@ class MultiSourceCandidateExtractor:
 
             self.DirectoryReader = classes['IndexReader']
             self.FSDirectory = classes['FSDirectory']
-            self.Path = classes['Path']
+            self.JavaPaths = classes['JavaPaths']
+            self.DirectoryReader = classes['DirectoryReader']
             self.IndexSearcher = classes['IndexSearcher']
             self.QueryParser = classes['QueryParser']
             self.EnglishAnalyzer = classes['EnglishAnalyzer']
@@ -117,7 +167,7 @@ class MultiSourceCandidateExtractor:
             self.TermQuery = classes['TermQuery']
             self.BytesRef = classes['BytesRef']
 
-            directory = self.FSDirectory.open(self.Path.get(self.index_path))
+            directory = self.FSDirectory.open(self.JavaPaths.get(self.index_path))
             self.lucene_reader = self.DirectoryReader.open(directory)
             self.lucene_searcher = self.IndexSearcher(self.lucene_reader.getContext())
             self.analyzer = self.EnglishAnalyzer()
@@ -134,6 +184,9 @@ class MultiSourceCandidateExtractor:
         except Exception as e:
             logger.error(f"Failed to initialize Lucene: {e}")
             raise
+            
+        # Optimization: Cache for extract_all_candidates
+        self._cache = {}
 
     def extract_all_candidates(
             self,
@@ -148,19 +201,29 @@ class MultiSourceCandidateExtractor:
         individual term statistics calculation.
         """
         all_candidates = []
+        
+        # Check cache (only if no override)
+        cache_key = (query_text, query_id)
+        if kb_override is None and cache_key in self._cache:
+            # logger.debug(f"Cache hit for query: {query_text[:30]}...")
+            return self._cache[cache_key]
 
         # 1. Retrieve pseudo-relevant documents once (shared across calculations)
         # Returns (list of text, list of tokenized lists)
+        print("DEBUG: Calling _get_pseudo_relevant_docs_and_tokens", flush=True)
         pseudo_docs, pseudo_docs_tokens = self._get_pseudo_relevant_docs_and_tokens(
             query_text, self.n_pseudo_docs
         )
+        print(f"DEBUG: Retrieved {len(pseudo_docs)} pseudo docs", flush=True)
+
+        # Prepare query terms for exclusion (stemmed)
+        query_terms = set(self._tokenize_and_stem(query_text))
 
         # === 1. DOCS SOURCE (RM3) ===
         logger.debug(f"Extracting RM3 candidates for: {query_text[:50]}")
 
         try:
-            # We assume RM3 scorer handles its own retrieval internally for the model,
-            # though ideally we would pass the retrieved docs to it to save compute.
+            print(f"DEBUG: Extracting RM3 candidates", flush=True)
             rm3_terms = self.rm3_scorer.expand(
                 query_str=query_text,
                 n_docs=self.n_pseudo_docs,
@@ -169,7 +232,16 @@ class MultiSourceCandidateExtractor:
             )
 
             for rank, (term, rm3_score) in enumerate(rm3_terms, start=1):
+                term_l = term.strip().lower()
+                if term_l in self.stopwords or term_l in query_terms:
+                    continue
+                
                 df, cf = self._get_term_stats(term)
+                
+                # Filter out generic high-frequency terms (>3% of collection)
+                if df > (self.collection_size * 0.03):
+                    continue
+                
                 # Use pre-tokenized docs for efficiency
                 tf_pseudo = self._compute_tf_pseudo_optimized(term, pseudo_docs_tokens)
                 coverage = self._compute_coverage_optimized(term, pseudo_docs)
@@ -194,6 +266,7 @@ class MultiSourceCandidateExtractor:
         # === 2. KB SOURCE (WITH OVERRIDE SUPPORT) ===
         if kb_override is not None:
             # Use precomputed KB candidates
+            print(f"DEBUG: Using {len(kb_override)} precomputed KB candidates", flush=True)
             logger.debug(f"Using {len(kb_override)} precomputed KB candidates")
 
             try:
@@ -202,13 +275,20 @@ class MultiSourceCandidateExtractor:
                     term = kb_cand_dict.get('term')
                     if not term:
                         continue
-
+                    
+                    term_l = term.strip().lower()
+                    if term_l in query_terms or term_l in self.stopwords:
+                        continue
+                        
                     confidence = kb_cand_dict.get('confidence', 1.0)
                     # Use provided rank if available, else enumeration
                     cand_rank = kb_cand_dict.get('rank', rank)
 
                     df, cf = self._get_term_stats(term)
 
+                    if df > (self.collection_size * 0.03):
+                        continue
+                    
                     all_candidates.append(CandidateTerm(
                         term=term,
                         source="kb",
@@ -233,7 +313,16 @@ class MultiSourceCandidateExtractor:
                 )
 
                 for rank, kb_cand in enumerate(kb_candidates[:self.n_kb], start=1):
-                    df, cf = self._get_term_stats(kb_cand.term)
+                    term = kb_cand.term
+                    term_l = term.strip().lower()
+                    if term_l in self.stopwords or term_l in query_terms:
+                        continue
+                        
+                    df, cf = self._get_term_stats(term)
+                    
+                    if df > (self.collection_size * 0.03):
+                        continue
+                        
                     all_candidates.append(CandidateTerm(
                         term=kb_cand.term,
                         source="kb",
@@ -251,6 +340,7 @@ class MultiSourceCandidateExtractor:
 
         # === 3. EMBEDDING SOURCE ===
         if self.emb_extractor:
+            print(f"DEBUG: Extracting embedding candidates", flush=True)
             logger.debug(f"Extracting embedding candidates for: {query_text[:50]}")
             try:
                 emb_candidates = self.emb_extractor.extract_candidates(
@@ -259,7 +349,15 @@ class MultiSourceCandidateExtractor:
                 )
 
                 for rank, (term, cos_sim) in enumerate(emb_candidates, start=1):
+                    term_l = term.strip().lower()
+                    if term_l in self.stopwords or term_l in query_terms:
+                        continue
+                        
                     df, cf = self._get_term_stats(term)
+                    
+                    if df > (self.collection_size * 0.03):
+                        continue
+                        
                     all_candidates.append(CandidateTerm(
                         term=term,
                         source="emb",
@@ -275,22 +373,131 @@ class MultiSourceCandidateExtractor:
             except Exception as e:
                 logger.warning(f"Embedding extraction failed: {e}")
 
+        # === 4. LLM SOURCE ===
+        if query_id and str(query_id) in self.llm_cache:
+            # Extract LLM candidates
+            # Logic: Entities/Synonyms get boost=5, Passage gets boost=1
+            llm_data = self.llm_cache[str(query_id)].get('llm_data', {})
+            
+            # Helper to tokenize (simple whitespace + lower)
+            def tokenize(text):
+                return re.findall(r'\w+', text.lower())
+
+            term_counts = Counter()
+
+            # Boost Entities
+            for ent in llm_data.get('entities', []):
+                for t in tokenize(ent):
+                    if t not in self.stopwords: # Use filtered stopwords
+                        term_counts[t] += 5
+
+            # Boost Synonyms
+            for syn in llm_data.get('synonyms', []):
+                for t in tokenize(syn):
+                    if t not in self.stopwords:
+                        term_counts[t] += 5
+
+            # Standard Passage
+            passage = llm_data.get('passage', '')
+            for t in tokenize(passage):
+                if t not in self.stopwords:
+                    term_counts[t] += 1
+            
+            # Convert to CandidateTerms
+            # "Heuristic: If a term is in data['entities'], give it a starting count of 5" -> We did this via Accumulation
+            # Rank by total count
+            sorted_terms = term_counts.most_common(self.n_docs_rm3) # Reuse n_docs_rm3 limit or define new n_llm
+
+            for rank, (term, count) in enumerate(sorted_terms, start=1):
+                 term_l = term.strip().lower()
+                 if term_l in query_terms: # Stopwords already filtered in Counter part
+                     continue
+                     
+                 df, cf = self._get_term_stats(term)
+                 
+                 if df > (self.collection_size * 0.03):
+                     continue
+                 all_candidates.append(CandidateTerm(
+                     term=term,
+                     source="llm",
+                     rm3_score=0.0,
+                     tf_pseudo=0.0,
+                     coverage_pseudo=0.0,
+                     df=df,
+                     cf=cf,
+                     native_rank=rank,
+                     native_score=float(count), # Score = Frequency/Boost count
+                 ))
+            logger.debug(f"Extracted {len(sorted_terms)} LLM candidates")
+
         logger.info(f"Total candidates extracted: {len(all_candidates)}")
+        if kb_override is None:
+             self._cache[cache_key] = all_candidates
         return all_candidates
 
     def _perform_lucene_search(self, query: str, n: int):
         """
         Centralized helper to perform Lucene search and return top docs.
-        Returns Tuple(TopDocs, score_docs).
+        Returns TopDocs object.
         """
         try:
-            query_parser = self.QueryParser(self.field_name, self.analyzer)
-            lucene_query = query_parser.parse(query)
+            # Tokenize query to build a BooleanQuery (more robust than raw QueryParser)
+            print(f"DEBUG: Tokenizing query for search: {query}", flush=True)
+            query_tokens = self._tokenize_for_search(query)
+            print(f"DEBUG: Tokens: {query_tokens}", flush=True)
+            
+            if not query_tokens:
+                # If tokenization returns nothing (e.g. all stopwords), 
+                # try a simple whitespace split as ultimate fallback
+                query_tokens = [t.strip().lower() for t in query.split() if t.strip()]
+            
+            if not query_tokens:
+                return None
+
+            builder = self.BooleanQueryBuilder()
+            from jnius import autoclass
+            Occur = autoclass('org.apache.lucene.search.BooleanClause$Occur')
+            
+            for token in query_tokens:
+                # Use TermQuery for each token - this avoids QueryParser entirely
+                term_query = self.TermQuery(self.Term(self.field_name, token))
+                builder.add(term_query, Occur.SHOULD)
+            
+            lucene_query = builder.build()
+            print("DEBUG: Executing Lucene Search...", flush=True)
             top_docs = self.lucene_searcher.search(lucene_query, n)
+            print(f"DEBUG: Search returned {top_docs.totalHits} hits", flush=True)
             return top_docs
+
         except Exception as e:
             logger.warning(f"Lucene search failed for query '{query}': {e}")
-            return None
+            # Final fallback: escape and parse if BooleanQuery build failed for some reason
+            try:
+                escaped_query = self.QueryParser.escape(query)
+                query_parser = self.QueryParser(self.field_name, self.analyzer)
+                lucene_query = query_parser.parse(escaped_query)
+                return self.lucene_searcher.search(lucene_query, n)
+            except Exception as e2:
+                logger.error(f"Ultimate Lucene search failure for '{query}': {e2}")
+                return None
+
+    def _tokenize_for_search(self, query_text: str) -> List[str]:
+        """Tokenize query text using the same analyzer as the index."""
+        try:
+            token_stream = self.analyzer.tokenStream(self.field_name, query_text)
+            token_stream.reset()
+            from jnius import autoclass
+            CharTermAttribute = autoclass("org.apache.lucene.analysis.tokenattributes.CharTermAttribute")
+            term_attr = token_stream.getAttribute(CharTermAttribute)
+            terms = []
+            while token_stream.incrementToken():
+                terms.append(term_attr.toString())
+            token_stream.end()
+            token_stream.close()
+            return terms
+        except Exception as e:
+            logger.debug(f"Tokenization failed for search: {e}")
+            return []
 
     def _get_pseudo_relevant_docs_and_tokens(
             self,
@@ -331,31 +538,21 @@ class MultiSourceCandidateExtractor:
             return 1, 1
 
         try:
-            # Get terms for the field
-            terms = self.lucene_reader.terms(self.field_name)
-            if terms is None:
-                return 1, 1
-
-            # Get term iterator
-            terms_enum = terms.iterator()
-
-            # SAFELY Create BytesRef
+            # SAFELY Create Term
             try:
                 # Ensure clean UTF-8 encoding
-                term_encoded = term.strip().lower().encode('utf-8')
-                term_bytes = self.BytesRef(term_encoded)
+                # term_encoded = term.strip().lower().encode('utf-8')
+                # term_bytes = self.BytesRef(term_encoded)
+                # Actually IndexReader.docFreq takes a Term object
+                lucene_term = self.Term(self.field_name, term.strip().lower())
             except Exception as e:
-                logger.debug(f"Failed to encode term '{term}' for Lucene lookup: {e}")
+                logger.debug(f"Failed to create Term '{term}': {e}")
                 return 1, 1
 
-            # Seek to term
-            if terms_enum.seekExact(term_bytes):
-                df = terms_enum.docFreq()
-                cf = terms_enum.totalTermFreq()
-                return max(df, 1), max(cf, 1)
-
-            # Term not found
-            return 1, 1
+            df = self.lucene_reader.docFreq(lucene_term)
+            cf = self.lucene_reader.totalTermFreq(lucene_term)
+            
+            return max(df, 1), max(cf, 1)
 
         except Exception as e:
             # Fallback for weird JNI errors or index issues
@@ -576,6 +773,23 @@ class MultiSourceCandidateExtractor:
         # Default fallback
         return "informational"
 
+    def _tokenize_and_stem(self, text: str) -> List[str]:
+        """Tokenize and stem text using Lucene's EnglishAnalyzer."""
+        tokens = []
+        try:
+            token_stream = self.analyzer.tokenStream(self.field_name, text)
+            term_attr = token_stream.addAttribute(get_lucene_classes()['CharTermAttribute'])
+            token_stream.reset()
+            while token_stream.incrementToken():
+                tokens.append(term_attr.toString())
+            token_stream.end()
+            token_stream.close()
+        except Exception as e:
+            logger.warning(f"Stemming failed: {e}")
+            # Fallback to simple tokenization
+            tokens = re.findall(r'\w+', text.lower())
+        return tokens
+
     def __del__(self):
         """Clean up Lucene reader."""
         try:
@@ -612,6 +826,14 @@ def _main_cli():
     emb_extractor = None
     if args.vocab_embeddings:
         emb_extractor = EmbeddingCandidateExtractor(encoder=encoder, vocab_path=args.vocab_embeddings)
+
+    from src.utils.lucene_utils import initialize_lucene
+    
+    # Initialize Lucene (adjust path as needed)
+    lucene_path = "lucene_jars"
+    if not initialize_lucene(lucene_path):
+        print("Failed to initialize Lucene")
+        return
 
     logger.info("Initializing candidate extractor...")
     extractor = MultiSourceCandidateExtractor(

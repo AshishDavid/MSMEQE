@@ -104,7 +104,7 @@ def precompute_kb_candidates(
     Returns:
         Dictionary {query_id: [candidate_dicts]}
     """
-    from msmeqe.expansion.kb_expansion import KBCandidateExtractor
+    from src.expansion.kb_expansion import KBCandidateExtractor
 
     logger.info("Initializing KB extractor...")
     kb_extractor = KBCandidateExtractor(

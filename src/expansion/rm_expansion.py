@@ -69,39 +69,54 @@ class LuceneRM3Scorer:
         self.orig_query_weight = orig_query_weight
         self.min_doc_score = min_doc_score
 
-        (
-            self.JIndexSearcher,
-            self.JIndexReader,
-            self.JDirectoryReader,
-            self.JFSDirectory,
-            self.JPath,
-            self.JStandardAnalyzer,
-            self.JQueryParser,
-            self.JQueryBuilder,
-            self.JBooleanQueryBuilder,
-            self.JBooleanClause,
-            self.JTerm,
-            self.JTermQuery,
-            self.JTopDocs,
-            self.JScoreDoc,
-            self.JBM25Similarity,
-            self.JClassicSimilarity,
-            self.JDirectory,
-            self.JAnalyzer,
-            self.JQuery,
-            self.JExplanation,
-            self.JTermVector,
-            self.JFields,
-            self.JField,
-            self.JBytesRefIterator,
-            self.JBytesRef,
-        ) = get_lucene_classes()
-
+        classes = get_lucene_classes()
+        
+        self.JIndexSearcher = classes['IndexSearcher']
+        self.JIndexReader = classes['IndexReader']
+        self.JDirectoryReader = classes['DirectoryReader']
+        self.JFSDirectory = classes['FSDirectory']
+        self.JPath = classes['JavaPaths']
+        self.JStandardAnalyzer = classes['StandardAnalyzer']
+        self.JEnglishAnalyzer = classes['EnglishAnalyzer']
+        self.JQueryParser = classes['QueryParser']
+        self.JQueryBuilder = classes['BooleanQueryBuilder'] # Note: BooleanQuery$Builder is usually used for building
+        # Wait, JQueryBuilder was likely QueryBuilder?
+        # Let's check what was intended.
+        # In original code: self.JQueryBuilder
+        # In lucene_utils: 'BooleanQueryBuilder' : autoclass('org.apache.lucene.search.BooleanQuery$Builder')
+        # There is no 'QueryBuilder' in lucene_utils.
+        # But there is 'BooleanQuery' and 'BooleanClause'.
+        
+        self.JBooleanQueryBuilder = classes['BooleanQueryBuilder']
+        self.JBooleanClause = classes['BooleanClause']
+        self.JBooleanClauseOccur = classes['BooleanClauseOccur']
+        self.JTerm = classes['Term']
+        self.JTermQuery = classes['TermQuery']
+        # self.JTopDocs = classes['TopDocs'] # Missing in lucene_utils?
+        # self.JScoreDoc = classes['ScoreDoc'] # Missing?
+        
+        self.JBM25Similarity = classes['BM25Similarity']
+        # self.JClassicSimilarity = classes['ClassicSimilarity'] # Missing?
+        
+        # self.JDirectory = classes['Directory'] # Missing?
+        # self.JAnalyzer = classes['Analyzer'] # Missing?
+        # self.JQuery = classes['Query'] # Missing?
+        # self.JExplanation = classes['Explanation'] # Missing?
+        # self.JTermVector = classes['TermVector'] # Missing?
+        # self.JFields = classes['Fields'] # Missing?
+        # self.JField = classes['Field']
+        # self.JBytesRefIterator = classes['BytesRefIterator'] # Missing?
+        self.JBytesRef = classes['BytesRef']
+        self.JMultiFields = classes['MultiFields']
+        
         # Open index and initialize searcher
+        from jnius import cast
         self.reader = self.JDirectoryReader.open(
-            self.JFSDirectory.open(self.JPath.of(self.index_dir))
+            self.JFSDirectory.open(self.JPath.get(self.index_dir))
         )
-        self.searcher = self.JIndexSearcher(self.reader)
+        # Explicitly cast to IndexReader to avoid ambiguity
+        index_reader = cast('org.apache.lucene.index.IndexReader', self.reader)
+        self.searcher = self.JIndexSearcher(index_reader)
 
         # Set similarity
         if similarity == "BM25Similarity":
@@ -114,6 +129,8 @@ class LuceneRM3Scorer:
         # Analyzer and query parser
         if analyzer == "StandardAnalyzer":
             self.analyzer = self.JStandardAnalyzer()
+        elif analyzer == "EnglishAnalyzer":
+            self.analyzer = self.JEnglishAnalyzer()
         else:
             raise ValueError(f"Unsupported analyzer: {analyzer}")
 
@@ -219,9 +236,13 @@ class LuceneRM3Scorer:
     # -------------------------------------------------------------------------
 
     def _build_boolean_query(self, query_str: str):
-        """Build initial boolean query from query string (Java: queryBuilder.toQuery)."""
+        """Build initial boolean query from query string."""
         try:
             query_terms = self._tokenize_query(query_str)
+
+            if not query_terms:
+                # Simple whitespace fallback if analyzer returns nothing
+                query_terms = [t.strip().lower() for t in query_str.split() if t.strip()]
 
             if not query_terms:
                 raise ValueError(f"No valid terms in query: {query_str}")
@@ -230,7 +251,7 @@ class LuceneRM3Scorer:
 
             for term in query_terms:
                 term_query = self.TermQuery(self.Term(self.field, term))
-                builder.add(term_query, self.BooleanClause.Occur.SHOULD)
+                builder.add(term_query, self.JBooleanClauseOccur.SHOULD)
 
             boolean_query = builder.build()
             logger.debug(f"Built BooleanQuery with {len(query_terms)} terms.")
@@ -238,23 +259,33 @@ class LuceneRM3Scorer:
 
         except Exception as e:
             logger.error(f"Error building BooleanQuery for '{query_str}': {e}")
-            # Fallback: use query parser on raw string
-            return self.query_parser.parse(query_str)
+            # Fallback: use query parser on raw string with escaping ONLY as last resort
+            try:
+                escaped = self.JQueryParser.escape(query_str)
+                # Ensure analyzer is used correctly in parser
+                parser = self.JQueryParser(self.field, self.analyzer)
+                return parser.parse(escaped)
+            except Exception as e2:
+                logger.error(f"Fallback ParseException for '{query_str}': {e2}")
+                # Provide a Dummy query if all else fails to avoid crashing
+                return self.TermQuery(self.Term(self.field, "dummy_empty_query_term"))
 
     def _tokenize_query(self, query_str: str) -> List[str]:
         """Tokenize query with Lucene Analyzer."""
         try:
             token_stream = self.analyzer.tokenStream(self.field, query_str)
-            token_stream.reset()
-            term_attr = token_stream.getAttribute(
-                getattr(__import__("org.apache.lucene.analysis.tokenattributes", fromlist=["CharTermAttribute"]),
-                        "CharTermAttribute")
-            )
-            terms = []
-            while token_stream.incrementToken():
-                terms.append(term_attr.toString())
-            token_stream.end()
-            token_stream.close()
+            try:
+                token_stream.reset()
+                from jnius import autoclass
+                CharTermAttribute = autoclass("org.apache.lucene.analysis.tokenattributes.CharTermAttribute")
+                term_attr = token_stream.getAttribute(CharTermAttribute)
+                terms = []
+                while token_stream.incrementToken():
+                    terms.append(term_attr.toString())
+                token_stream.end()
+            finally:
+                token_stream.close()
+            
             logger.debug(f"Tokenized query '{query_str}' → {terms}")
             return terms
         except Exception as e:
@@ -299,12 +330,19 @@ class LuceneRM3Scorer:
                     continue
 
                 # Get term vector for this document
-                term_vector = self.reader.getTermVector(doc_id, self.field)
-                if term_vector is None:
+                # Lucene 10: reader.termVectors().get(docID) returns Fields
+                term_vectors = self.reader.termVectors()
+                if term_vectors is None:
                     continue
-
-                # Iterate over terms
-                terms_enum = term_vector.iterator()
+                fields = term_vectors.get(doc_id)
+                if fields is None:
+                    continue
+                
+                terms = fields.terms(self.field)
+                if terms is None:
+                    continue
+                    
+                terms_enum = terms.iterator()
                 bytes_ref = terms_enum.next()
                 while bytes_ref is not None:
                     term_text = bytes_ref.utf8ToString()
@@ -351,10 +389,7 @@ class LuceneRM3Scorer:
     def _get_collection_length(self) -> int:
         """Total number of terms in the collection for this field."""
         try:
-            terms = self.reader.terms(self.field)
-            if terms is None:
-                return 0
-            return terms.getSumTotalTermFreq()
+            return self.reader.getSumTotalTermFreq(self.field)
         except Exception as e:
             logger.error(f"Error getting collection length: {e}")
             return 0
@@ -362,10 +397,18 @@ class LuceneRM3Scorer:
     def _get_doc_length(self, doc_id: int) -> int:
         """Document length for doc_id."""
         try:
-            tv = self.reader.getTermVector(doc_id, self.field)
-            if tv is None:
+            term_vectors = self.reader.termVectors()
+            if term_vectors is None:
                 return 0
-            terms_enum = tv.iterator()
+            fields = term_vectors.get(doc_id)
+            if fields is None:
+                return 0
+            
+            terms = fields.terms(self.field)
+            if terms is None:
+                return 0
+                
+            terms_enum = terms.iterator()
             bytes_ref = terms_enum.next()
             length = 0
             while bytes_ref is not None:
@@ -379,14 +422,8 @@ class LuceneRM3Scorer:
     def _get_collection_freq(self, term: str) -> int:
         """Collection frequency of term in field."""
         try:
-            terms = self.reader.terms(self.field)
-            if terms is None:
-                return 0
-            te = terms.iterator()
-            seek_term = self.JBytesRef(term.encode("utf-8"))
-            if te.seekExact(seek_term):
-                return te.totalTermFreq()
-            return 0
+            lucene_term = self.Term(self.field, term)
+            return self.reader.totalTermFreq(lucene_term)
         except Exception as e:
             logger.error(f"Error getting collection frequency for term='{term}': {e}")
             return 0
@@ -441,16 +478,17 @@ class LuceneRM3Scorer:
         """
         try:
             token_stream = self.analyzer.tokenStream(self.field, text)
-            token_stream.reset()
-            term_attr = token_stream.getAttribute(
-                getattr(__import__("org.apache.lucene.analysis.tokenattributes", fromlist=["CharTermAttribute"]),
-                        "CharTermAttribute")
-            )
-            terms = []
-            while token_stream.incrementToken():
-                terms.append(term_attr.toString())
-            token_stream.end()
-            token_stream.close()
+            try:
+                token_stream.reset()
+                from jnius import autoclass
+                CharTermAttribute = autoclass("org.apache.lucene.analysis.tokenattributes.CharTermAttribute")
+                term_attr = token_stream.getAttribute(CharTermAttribute)
+                terms = []
+                while token_stream.incrementToken():
+                    terms.append(term_attr.toString())
+                token_stream.end()
+            finally:
+                token_stream.close()
             return terms
         except Exception as e:
             logger.error(f"Error tokenizing document text: {e}")

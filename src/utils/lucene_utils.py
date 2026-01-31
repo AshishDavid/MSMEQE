@@ -16,18 +16,25 @@ def get_lucene_classes():
             from jnius import autoclass
             _lucene_classes = {
                 'FSDirectory': autoclass('org.apache.lucene.store.FSDirectory'),
+                'JavaPaths': autoclass('java.nio.file.Paths'),
                 'Path': autoclass('java.nio.file.Paths'),
+                'JString': autoclass('java.lang.String'),
                 'Document': autoclass('org.apache.lucene.document.Document'),
                 'Field': autoclass('org.apache.lucene.document.Field'),
+                'FieldType': autoclass('org.apache.lucene.document.FieldType'),
                 'TextField': autoclass('org.apache.lucene.document.TextField'),
                 'StringField': autoclass('org.apache.lucene.document.StringField'),
                 'StoredField': autoclass('org.apache.lucene.document.StoredField'),
+                'StandardAnalyzer': autoclass('org.apache.lucene.analysis.standard.StandardAnalyzer'),
                 'EnglishAnalyzer': autoclass('org.apache.lucene.analysis.en.EnglishAnalyzer'),
+                'WhitespaceAnalyzer': autoclass('org.apache.lucene.analysis.core.WhitespaceAnalyzer'),
                 'IndexWriterConfig': autoclass('org.apache.lucene.index.IndexWriterConfig'),
                 'IndexWriter': autoclass('org.apache.lucene.index.IndexWriter'),
                 'FieldStore': autoclass('org.apache.lucene.document.Field$Store'),
+                'IndexOptions': autoclass('org.apache.lucene.index.IndexOptions'),
                 'IndexReader': autoclass('org.apache.lucene.index.DirectoryReader'),
                 'IndexSearcher': autoclass('org.apache.lucene.search.IndexSearcher'),
+                'QueryParser': autoclass('org.apache.lucene.queryparser.classic.QueryParser'),
                 'Term': autoclass('org.apache.lucene.index.Term'),
                 'TermQuery': autoclass('org.apache.lucene.search.TermQuery'),
                 'BooleanQuery' : autoclass('org.apache.lucene.search.BooleanQuery'),
@@ -37,8 +44,13 @@ def get_lucene_classes():
                 'BM25Similarity' : autoclass('org.apache.lucene.search.similarities.BM25Similarity'),
                 'ConstantScoreQuery': autoclass('org.apache.lucene.search.ConstantScoreQuery'),
                 'DirectoryReader' : autoclass('org.apache.lucene.index.DirectoryReader'),
-                'CharTermAttribute': autoclass('org.apache.lucene.analysis.tokenattributes.CharTermAttribute')
-
+                'CharTermAttribute': autoclass('org.apache.lucene.analysis.tokenattributes.CharTermAttribute'),
+                'BytesRef': autoclass('org.apache.lucene.util.BytesRef'),
+                'StringReader': autoclass('java.io.StringReader'),
+                'MultiTerms': autoclass('org.apache.lucene.index.MultiTerms'),
+                'MultiFields': autoclass('org.apache.lucene.index.MultiFields'),
+                'IndexOptions': autoclass('org.apache.lucene.index.IndexOptions'),
+                'BooleanClauseOccur': autoclass('org.apache.lucene.search.BooleanClause$Occur')
             }
         except Exception as e:
             logger.error(f"Error loading Lucene classes: {e}")

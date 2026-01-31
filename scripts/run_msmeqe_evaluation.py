@@ -42,7 +42,9 @@ from collections import defaultdict
 import numpy as np
 from tqdm import tqdm
 import joblib
+import joblib
 from src.utils.lucene_utils import initialize_lucene
+from src.models.budget_predictor import BudgetPredictor
 
 logger = logging.getLogger(__name__)
 
@@ -242,7 +244,7 @@ class DenseRetriever:
             )
 
         logger.info(f"Loading document embeddings from {doc_emb_path}")
-        self.doc_embeddings = np.load(str(doc_emb_path))
+        self.doc_embeddings = np.load(str(doc_emb_path), mmap_mode='r')
 
         with open(doc_ids_path, 'r') as f:
             self.doc_ids = json.load(f)
@@ -343,94 +345,120 @@ class MSMEQEEvaluationPipeline:
 
         # Storage
         run_results = {}
-        per_query_stats = []
+        # per_query_stats removed from memory to avoid OOM and enable incremental writing
 
         start_time = time.time()
+        
+        # Prepare output file if requested
+        stats_file = None
+        if log_per_query_path:
+            p = Path(log_per_query_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            stats_file = open(p, 'w')
 
-        for qid, qtext in tqdm(queries.items(), desc="MS-MEQE evaluation"):
-            try:
-                # === 1. EXTRACT CANDIDATES (WITH KB OVERRIDE) ===
+        try:
+            total_queries = len(queries)
+            for idx, (qid, qtext) in enumerate(tqdm(queries.items(), desc="MS-MEQE evaluation")):
+                
+                # Periodic logging for monitoring
+                if idx % 50 == 0:
+                    logger.info(f"Processing query {idx+1}/{total_queries} ({qid})")
 
-                # Get precomputed KB candidates if available
-                kb_override = self.kb_candidates_map.get(qid) if self.kb_candidates_map else None
+                try:
+                    # === 1. EXTRACT CANDIDATES (WITH KB OVERRIDE) ===
 
-                if kb_override:
-                    logger.debug(f"Using {len(kb_override)} precomputed KB candidates for {qid}")
+                    # Get precomputed KB candidates if available
+                    kb_override = self.kb_candidates_map.get(qid) if self.kb_candidates_map else None
 
-                # Extract candidates with kb_override
-                candidates = self.candidate_extractor.extract_all_candidates(
-                    query_text=qtext,
-                    query_id=qid,
-                    kb_override=kb_override,
-                )
+                    if kb_override:
+                        logger.debug(f"Using {len(kb_override)} precomputed KB candidates for {qid}")
 
-                if not candidates:
-                    logger.warning(f"No candidates for query {qid}, using original query")
+                    # Extract candidates with kb_override
+                    candidates = self.candidate_extractor.extract_all_candidates(
+                        query_text=qtext,
+                        query_id=qid,
+                        kb_override=kb_override,
+                    )
+
+                    if not candidates:
+                        logger.warning(f"No candidates for query {qid}, using original query")
+                        q_emb = self.encoder.encode([qtext])[0]
+                        results = self.dense_retriever.retrieve(q_emb, k=topk)
+                        run_results[qid] = results
+                        if stats_file:
+                             stats_file.write(json.dumps({
+                                 'qid': qid, 
+                                 'error': 'no_candidates'
+                             }) + '\n')
+                             stats_file.flush()
+                        continue
+
+                    # Count candidates by source
+                    source_counts = defaultdict(int)
+                    for cand in candidates:
+                        source_counts[cand.source] += 1
+
+                    # === 2. COMPUTE QUERY STATS ===
+                    query_stats = self.candidate_extractor.compute_query_stats(qtext)
+                    pseudo_centroid = self.candidate_extractor.compute_pseudo_centroid(qtext)
+
+                    # === 3. RUN MS-MEQE EXPANSION ===
+                    selected_terms, q_star = self.msmeqe_model.expand(
+                        query_text=qtext,
+                        candidates=candidates,
+                        pseudo_doc_centroid=pseudo_centroid,
+                        query_stats=query_stats,
+                    )
+
+                    # === 4. RETRIEVE WITH ENHANCED QUERY ===
+                    results = self.dense_retriever.retrieve(q_star, k=topk)
+                    run_results[qid] = results
+
+                    # === 5. LOG PER-QUERY STATS ===
+                    if stats_file:
+                        selected_source_counts = defaultdict(int)
+                        total_count = 0
+                        for term in selected_terms:
+                            selected_source_counts[term.source] += term.count
+                            total_count += term.count
+
+                        query_stat = {
+                            'qid': qid,
+                            'query_text': qtext,
+                            'num_candidates': len(candidates),
+                            'num_candidates_by_source': dict(source_counts),
+                            'num_selected_terms': len(selected_terms),
+                            'total_term_count': total_count,
+                            'selected_by_source': dict(selected_source_counts),
+                            'clarity': float(query_stats.get('clarity', 0)),
+                            'entropy': float(query_stats.get('entropy', 0)),
+                            'q_type': query_stats.get('q_type', 'unknown'),
+                            'q_len': query_stats.get('q_len', 0),
+                            'selected_terms': [
+                                {
+                                    'term': t.term,
+                                    'source': t.source,
+                                    'value': float(t.value),
+                                    'weight': float(t.weight),
+                                    'count': int(t.count),
+                                }
+                                for t in selected_terms
+                            ],
+                        }
+                        stats_file.write(json.dumps(query_stat) + '\n')
+                        stats_file.flush()
+
+                except Exception as e:
+                    logger.error(f"Failed to process query {qid}: {e}")
+                    # Fall back to original query
                     q_emb = self.encoder.encode([qtext])[0]
                     results = self.dense_retriever.retrieve(q_emb, k=topk)
                     run_results[qid] = results
                     continue
-
-                # Count candidates by source
-                source_counts = defaultdict(int)
-                for cand in candidates:
-                    source_counts[cand.source] += 1
-
-                # === 2. COMPUTE QUERY STATS ===
-                query_stats = self.candidate_extractor.compute_query_stats(qtext)
-                pseudo_centroid = self.candidate_extractor.compute_pseudo_centroid(qtext)
-
-                # === 3. RUN MS-MEQE EXPANSION ===
-                selected_terms, q_star = self.msmeqe_model.expand(
-                    query_text=qtext,
-                    candidates=candidates,
-                    pseudo_doc_centroid=pseudo_centroid,
-                    query_stats=query_stats,
-                )
-
-                # === 4. RETRIEVE WITH ENHANCED QUERY ===
-                results = self.dense_retriever.retrieve(q_star, k=topk)
-                run_results[qid] = results
-
-                # === 5. LOG PER-QUERY STATS ===
-                selected_source_counts = defaultdict(int)
-                total_count = 0
-                for term in selected_terms:
-                    selected_source_counts[term.source] += term.count
-                    total_count += term.count
-
-                query_stat = {
-                    'qid': qid,
-                    'query_text': qtext,
-                    'num_candidates': len(candidates),
-                    'num_candidates_by_source': dict(source_counts),
-                    'num_selected_terms': len(selected_terms),
-                    'total_term_count': total_count,
-                    'selected_by_source': dict(selected_source_counts),
-                    'clarity': float(query_stats.get('clarity', 0)),
-                    'entropy': float(query_stats.get('entropy', 0)),
-                    'q_type': query_stats.get('q_type', 'unknown'),
-                    'q_len': query_stats.get('q_len', 0),
-                    'selected_terms': [
-                        {
-                            'term': t.term,
-                            'source': t.source,
-                            'value': float(t.value),
-                            'weight': float(t.weight),
-                            'count': int(t.count),
-                        }
-                        for t in selected_terms
-                    ],
-                }
-                per_query_stats.append(query_stat)
-
-            except Exception as e:
-                logger.error(f"Failed to process query {qid}: {e}")
-                # Fall back to original query
-                q_emb = self.encoder.encode([qtext])[0]
-                results = self.dense_retriever.retrieve(q_emb, k=topk)
-                run_results[qid] = results
-                continue
+        
+        finally:
+            if stats_file:
+                stats_file.close()
 
         elapsed = time.time() - start_time
         logger.info(f"MS-MEQE evaluation completed in {elapsed:.1f}s")
@@ -441,35 +469,19 @@ class MSMEQEEvaluationPipeline:
         logger.info("\nMS-MEQE Results:")
         logger.info(f"  MAP:         {metrics.get('map', 0):.4f}")
         logger.info(f"  nDCG@10:     {metrics.get('ndcg_cut_10', 0):.4f}")
+        logger.info(f"  nDCG@20:     {metrics.get('ndcg_cut_20', 0):.4f}")
         logger.info(f"  MRR:         {metrics.get('recip_rank', 0):.4f}")
         logger.info(f"  Recall@100:  {metrics.get('recall_100', 0):.4f}")
         logger.info(f"  Recall@1000: {metrics.get('recall_1000', 0):.4f}")
         logger.info(f"  P@10:        {metrics.get('P_10', 0):.4f}")
-
-        # === SAVE PER-QUERY STATS ===
-        if log_per_query_path:
-            self._save_per_query_stats(per_query_stats, log_per_query_path)
+        logger.info(f"  P@20:        {metrics.get('P_20', 0):.4f}")
 
         return {
             'metrics': metrics,
             'run_results': run_results,
-            'per_query_stats': per_query_stats,
+            'per_query_stats': [],
             'elapsed_time': elapsed,
         }
-
-    def _save_per_query_stats(self, stats: List[Dict], output_path: str):
-        """Save per-query statistics to JSONL."""
-        logger.info(f"Saving per-query stats to: {output_path}")
-
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        with open(output_path, 'w') as f:
-            for stat in stats:
-                f.write(json.dumps(stat) + '\n')
-
-        logger.info(f"Saved stats for {len(stats)} queries")
-
 
 # ---------------------------------------------------------------------------
 # Helper Class for Ablations
@@ -517,11 +529,25 @@ def main():
     parser.add_argument("--rm3-alpha", type=float, default=0.5,
                         help="RM3 interpolation parameter")
 
+    # === MS-MEQE HYPERPARAMETERS ===
+    parser.add_argument("--lambda", dest="lambda_interp", type=float, default=0.3,
+                        help="Interpolation for enhanced query embedding (default: 0.3)")
+    parser.add_argument("--min-budget", type=int, default=20,
+                        help="Minimum expansion budget")
+    parser.add_argument("--max-budget", type=int, default=80,
+                        help="Maximum expansion budget")
+    parser.add_argument("--budget-step", type=int, default=5,
+                        help="Budget step size")
+
     # === KB COMPONENT ===
     parser.add_argument("--kb-candidates", type=str, default=None,
                         help="Path to precomputed KB candidates JSONL (OVERRIDES dynamic extraction)")
     parser.add_argument("--kb-wat-output", type=str, default=None,
                         help="Path to WAT output (alternative to --kb-candidates)")
+
+    # === LLM COMPONENT ===
+    parser.add_argument("--llm-candidates", type=str, default=None,
+                        help="Path to LLM-generated candidates JSONL")
 
     # === EMBEDDING COMPONENT ===
     parser.add_argument("--sbert-model", type=str,
@@ -663,6 +689,7 @@ def main():
         emb_extractor=emb_extractor,
         n_docs_rm3=args.rm3_terms,
         n_pseudo_docs=args.rm3_depth,
+        llm_candidates_path=args.llm_candidates,
     )
 
     # Initialize MS-MEQE model
@@ -674,11 +701,10 @@ def main():
         weight_model=weight_model,
         budget_model=budget_model,
         collection_size=args.collection_size,
-        lambda_interp=0.3,
-        # Optional: expose these as CLI args if needed
-        # min_budget=20,
-        # max_budget=80,
-        # budget_step=5,
+        lambda_interp=args.lambda_interp,
+        min_budget=args.min_budget,
+        max_budget=args.max_budget,
+        budget_step=args.budget_step,
     )
 
     # Initialize dense retriever
@@ -690,7 +716,7 @@ def main():
 
     # Initialize evaluator
     evaluator = TRECEvaluator(
-        metrics=['map', 'ndcg_cut_10', 'recip_rank', 'recall_100', 'recall_1000', 'P_10']
+        metrics=['map', 'ndcg_cut_10', 'ndcg_cut_20', 'recip_rank', 'recall_100', 'recall_1000', 'P_10', 'P_20']
     )
 
     # Create evaluation pipeline

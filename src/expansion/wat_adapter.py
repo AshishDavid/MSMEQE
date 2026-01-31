@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import List, Dict, Any, Optional
 
-from msmeqe.expansion.kb_expansion import KBEntity
+from src.expansion.data_types import KBEntity
 
 logger = logging.getLogger(__name__)
 

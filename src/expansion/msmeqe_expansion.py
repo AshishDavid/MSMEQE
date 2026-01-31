@@ -170,8 +170,8 @@ class MSMEQEExpansionModel:
 
         if self.min_budget <= 0 or self.max_budget <= 0:
             raise ValueError("Budgets must be positive")
-        if self.max_budget <= self.min_budget:
-            raise ValueError("max_budget must be > min_budget")
+        if self.max_budget < self.min_budget:
+            raise ValueError("max_budget must be >= min_budget")
         if self.budget_step <= 0:
             raise ValueError("budget_step must be positive")
 
@@ -252,20 +252,21 @@ class MSMEQEExpansionModel:
 
         # Predict values and weights
         logger.debug("MSMEQE: predicting values and weights")
-        v_pred = self._predict_values(X_val)  # (m,)
-        w_pred = self._predict_weights(X_wt)  # (m,)
+        v_pred = self._predict_values(X_val, candidates)  # Pass candidates for bias
+        w_pred = self._predict_weights(X_wt, candidates)  # (m,)
         w_pred = np.maximum(w_pred, 1e-6)  # ensure non-negative / non-zero
 
         # Predict budget
         logger.debug("MSMEQE: predicting budget")
         W = self._predict_budget(query_stats)
 
-        # Solve unbounded knapsack
-        logger.debug("MSMEQE: solving unbounded knapsack (m=%d, W=%d)", len(candidates), W)
-        counts = self._solve_unbounded_knapsack(
-            values=v_pred,
-            weights=w_pred,
-            budget=W,
+        # Solve Selection Problem (Polymorphic)
+        logger.debug("MSMEQE: solving selection problem (m=%d, W=%d)", len(candidates), W)
+        
+        counts = self._solve_selection(
+            values=v_pred, 
+            weights=w_pred, 
+            budget=float(W)
         )
 
         # Collect selected terms
@@ -283,7 +284,7 @@ class MSMEQEExpansionModel:
                 )
             )
 
-        logger.debug("MSMEQE: %d terms selected by knapsack", len(selected_terms))
+        logger.debug("MSMEQE: %d terms selected by optimization", len(selected_terms))
 
         # Build enhanced query embedding
         logger.debug("MSMEQE: constructing enhanced query embedding")
@@ -292,9 +293,27 @@ class MSMEQEExpansionModel:
             term_embeddings=term_embs,
             values=v_pred,
             counts=counts,
+            clarity=query_stats.get('clarity', 12.0),
         )
 
         return selected_terms, q_star
+
+    def _solve_selection(self, values: np.ndarray, weights: np.ndarray, budget: float) -> np.ndarray:
+        """
+        Solve the selection problem using Knapsack Optimization (OR-Tools).
+        Subclasses can override this to implement Greedy or other heuristics.
+        Returns:
+            counts (np.ndarray): Integer array of counts (0/1).
+        """
+        # Import here to avoid circular dependencies
+        from src.utils.knapsack_solver import solve_knapsack_ortools
+        
+        selected_mask = solve_knapsack_ortools(
+            values=values,
+            weights=weights,
+            budget=budget
+        )
+        return selected_mask.astype(np.int32)
 
     # ------------------------------------------------------------------
     # Feature extraction (using FeatureExtractor)
@@ -396,19 +415,44 @@ class MSMEQEExpansionModel:
     # Model predictions
     # ------------------------------------------------------------------
 
-    def _predict_values(self, X: np.ndarray) -> np.ndarray:
+    def _predict_values(self, X: np.ndarray, candidates: List[CandidateTerm] = None) -> np.ndarray:
         """Predict value v_{t,i} for each candidate using the value model."""
         if X.shape[0] == 0:
             return np.zeros((0,), dtype=np.float32)
         y = self.value_model.predict(X)
-        return np.asarray(y, dtype=np.float32).reshape(-1)
+        y = np.asarray(y, dtype=np.float32).reshape(-1)
 
-    def _predict_weights(self, X: np.ndarray) -> np.ndarray:
+        # Add source-based bias if candidates are provided
+        if candidates is not None:
+            for i, cand in enumerate(candidates):
+                # Small boost for high-confidence sources like KB or LLM 
+                # to prevent they being ignored by a conservative model
+                if cand.source == 'kb':
+                    y[i] += 0.01
+                elif cand.source == 'llm':
+                    y[i] += 0.005
+        
+        return y
+
+    def _predict_weights(self, X: np.ndarray, candidates: List[CandidateTerm] = None) -> np.ndarray:
         """Predict weight (risk) w_{t,i} for each candidate using the weight model."""
         if X.shape[0] == 0:
             return np.zeros((0,), dtype=np.float32)
         y = self.weight_model.predict(X)
-        return np.asarray(y, dtype=np.float32).reshape(-1)
+        y = np.asarray(y, dtype=np.float32).reshape(-1)
+
+        # Add hard penalties for generic/short terms if candidates are provided
+        if candidates is not None:
+            for i, cand in enumerate(candidates):
+                term = cand.term.lower()
+                # Heavy penalty for very short terms
+                if len(term) < 3:
+                    y[i] += 0.5
+                # Penalty for common/generic terms not in stopword list but still risky
+                if term in ['number', 'example', 'type', 'using', 'means', 'defined', 'includes', 'common', 'also']:
+                    y[i] += 0.2
+        
+        return y
 
     def _predict_budget(self, query_stats: Dict[str, float]) -> int:
         """
@@ -433,8 +477,13 @@ class MSMEQEExpansionModel:
             query_stats=query_stats,
         )
 
-        x_vec = x_vec.reshape(1, -1)
-        budget_pred = float(self.budget_model.predict(x_vec)[0])
+        if self.budget_model is None:
+            # If no model provided (e.g. during training or fixed budget), use min_budget
+            # (which should be equal to max_budget in fixed budget mode)
+            budget_pred = float(self.min_budget)
+        else:
+            x_vec = x_vec.reshape(1, -1)
+            budget_pred = float(self.budget_model.predict(x_vec)[0])
 
         # Clip and snap to nearest step
         clipped = max(self.min_budget, min(self.max_budget, budget_pred))
@@ -452,60 +501,71 @@ class MSMEQEExpansionModel:
     # Unbounded knapsack
     # ------------------------------------------------------------------
 
-    def _solve_unbounded_knapsack(
+    def _solve_greedy_selection(
             self,
             values: np.ndarray,
             weights: np.ndarray,
+            term_embeddings: np.ndarray,
             budget: int,
     ) -> np.ndarray:
         """
-        Unbounded knapsack DP:
-          max sum c_k * v_k  s.t. sum c_k * w_k <= W, c_k ∈ N
-
-        We discretize weights to integers via a scale factor and use
-        standard DP over capacity.
-
-        Returns:
-            counts: np.ndarray of length m with optimal c_k frequencies.
+        Greedy selection with Marginal Novelty and Soft Saturation.
+        
+        Algorithm:
+        1. While budget > 0:
+        2.   For each candidate k:
+        3.     Calculate marginal value: v'_k = v_k * (1 - max_sim(t_k, S)) * log(1 + current_count_k + 1)/log(1 + current_count_k)
+        4.     Pick k with highest v'_k / w_k
+        5.   If best v'_k / w_k > 0 and w_k <= budget:
+        6.     Add t_k, budget -= w_k
+        7.   Else: break
         """
         m = len(values)
         if m == 0 or budget <= 0:
             return np.zeros((m,), dtype=np.int32)
 
-        v = np.asarray(values, dtype=np.float32)
-        w = np.asarray(weights, dtype=np.float32)
-
-        # Scale weights so that median weight ≈ 5 (keep capacity manageable)
-        median_w = float(np.median(w))
-        scale = 1.0
-        if median_w > 0:
-            scale = 5.0 / median_w
-        w_scaled = np.maximum(1, np.round(w * scale).astype(np.int32))
-
-        W = int(budget)
-        dp = np.zeros(W + 1, dtype=np.float32)
-        choice = np.full(W + 1, -1, dtype=np.int32)
-
-        for cap in range(1, W + 1):
-            best_val = dp[cap]
-            best_item = -1
-            for i in range(m):
-                wi = w_scaled[i]
-                if wi <= cap:
-                    cand_val = v[i] + dp[cap - wi]
-                    if cand_val > best_val:
-                        best_val = cand_val
-                        best_item = i
-            dp[cap] = best_val
-            choice[cap] = best_item
-
         counts = np.zeros(m, dtype=np.int32)
-        cap = W
-        while cap > 0 and choice[cap] != -1:
-            i = choice[cap]
-            counts[i] += 1
-            cap -= w_scaled[i]
-
+        remaining_budget = float(budget)
+        
+        # Precompute similarities if possible or do it on the fly
+        # For simplicity and small m (~100), on the fly is fine.
+        
+        while remaining_budget > 0:
+            best_idx = -1
+            best_marginal_yield = -1.0
+            
+            for i in range(m):
+                if weights[i] > remaining_budget or counts[i] >= 3: # Hard limit of 3
+                    continue
+                
+                # Soft Saturation: gain = log(1 + c + 1) - log(1 + c) = log((c+2)/(c+1))
+                # normalized by log(2) so that first item has full value
+                saturation_gain = np.log2((counts[i] + 2) / (counts[i] + 1))
+                
+                # Marginal Novelty
+                novelty_factor = 1.0
+                if np.any(counts > 0):
+                    selected_indices = np.where(counts > 0)[0]
+                    # term_embeddings is (m, d)
+                    # max similarity of candidate i with all currently selected terms
+                    similarities = np.dot(term_embeddings[selected_indices], term_embeddings[i])
+                    max_sim = np.max(similarities)
+                    # Penalize novelty: if highly similar (e.g. 0.9), novelty is low (0.1)
+                    novelty_factor = 1.0 - max(0, max_sim)
+                
+                marginal_value = values[i] * novelty_factor * saturation_gain
+                yield_score = marginal_value / (weights[i] + 1e-6)
+                
+                if yield_score > best_marginal_yield:
+                    best_marginal_yield = yield_score
+                    best_idx = i
+            
+            if best_idx != -1 and best_marginal_yield > 0:
+                counts[best_idx] += 1
+                remaining_budget -= weights[best_idx]
+            else:
+                break
+                
         return counts
 
     # ------------------------------------------------------------------
@@ -518,6 +578,7 @@ class MSMEQEExpansionModel:
             term_embeddings: np.ndarray,
             values: np.ndarray,
             counts: np.ndarray,
+            clarity: float,
     ) -> np.ndarray:
         """
         Build magnitude-encoded enhanced query embedding:
@@ -547,6 +608,14 @@ class MSMEQEExpansionModel:
         scaled_vectors = np.stack(scaled_vectors, axis=0)
         scaled_weights = np.array(scaled_weights, dtype=np.float32)
 
+        # Dynamic Lambda: trust clear queries more
+        # Base clarity center is ~12. Range 8 to 20.
+        # If base_lambda=0.0, we keep it 0.0.
+        if self.lambda_interp > 0:
+            dyn_lambda = min(0.6, max(0.05, self.lambda_interp * (clarity / 12.0)))
+        else:
+            dyn_lambda = 0.0
+
         weighted_avg = np.sum(scaled_vectors, axis=0) / (np.sum(scaled_weights) + 1e-12)
-        q_star = (1.0 - self.lambda_interp) * query_embedding + self.lambda_interp * weighted_avg
+        q_star = (1.0 - dyn_lambda) * query_embedding + dyn_lambda * weighted_avg
         return q_star

@@ -69,6 +69,7 @@ class BudgetTrainingDataGenerator:
     def __init__(
             self,
             encoder: SemanticEncoder,
+            feature_extractor: FeatureExtractor,
             candidate_extractor: MultiSourceCandidateExtractor,
             value_model,
             weight_model,
@@ -90,12 +91,13 @@ class BudgetTrainingDataGenerator:
             collection_size: Number of documents in collection
         """
         self.encoder = encoder
+        self.feature_extractor = feature_extractor
         self.collection_size = collection_size
         self.candidate_extractor = candidate_extractor
         self.value_model = value_model
         self.weight_model = weight_model
 
-        self.budget_options = budget_options or [30, 50, 70]
+        self.budget_options = budget_options or list(range(10, 101, 10))
 
         # Initialize dense retrieval system
         self.index_path = index_path
@@ -117,25 +119,16 @@ class BudgetTrainingDataGenerator:
                 budget_step=1,
             )
 
-        self.evaluator = TRECEvaluator(metrics=['map'])
+        self.evaluator = TRECEvaluator(metrics=['map', 'ndcg_cut_10'])
 
         logger.info(f"Initialized BudgetTrainingDataGenerator with budgets: {self.budget_options}")
 
     def _init_retrieval_system(self):
-        """
-        Initialize dense retrieval system.
-
-        Loads pre-computed document embeddings from:
-          - {index_path}/doc_embeddings.npy
-          - {index_path}/doc_ids.json
-
-        If not found, falls back to simulation.
-        """
-        if not self.index_path:
-            logger.warning("No index_path provided, will use simulation")
-            self.doc_embeddings = None
-            self.doc_ids = None
-            return
+        """Force simulation."""
+        logger.warning("FORCING SIMULATION for budget data generation")
+        self.doc_embeddings = None
+        self.doc_ids = None
+        return
 
         # Load pre-computed document embeddings
         doc_embeddings_path = Path(self.index_path).parent / "doc_embeddings.npy"
@@ -148,7 +141,7 @@ class BudgetTrainingDataGenerator:
 
         if doc_embeddings_path.exists() and doc_ids_path.exists():
             logger.info(f"Loading pre-computed document embeddings from {doc_embeddings_path}")
-            self.doc_embeddings = np.load(str(doc_embeddings_path))  # Shape: (N, d)
+            self.doc_embeddings = np.load(str(doc_embeddings_path), mmap_mode='r')  # Shape: (N, d)
 
             with open(doc_ids_path, 'r') as f:
                 self.doc_ids = json.load(f)  # List of doc IDs
@@ -168,6 +161,7 @@ class BudgetTrainingDataGenerator:
             qrels: Dict[str, Dict[str, int]],  # {query_id: {doc_id: relevance}}
             output_path: str,
             max_queries: int = None,
+            kb_candidates_map: Dict[str, List[Dict]] = None
     ):
         """
         Generate training data for budget prediction.
@@ -177,9 +171,17 @@ class BudgetTrainingDataGenerator:
             qrels: Query ID -> doc ID -> relevance
             output_path: Where to save training data
             max_queries: Limit number of queries (for testing)
+            kb_candidates_map: Optional map of query_id to pre-extracted KB candidates.
+                               If provided, these will override dynamic KB extraction.
         """
+        kb_candidates_map = kb_candidates_map or {}
+        # Filter queries to those with qrels first
+        queries_with_qrels = {qid: qtext for qid, qtext in queries.items() if qid in qrels}
+        
         if max_queries:
-            queries = dict(list(queries.items())[:max_queries])
+            queries = dict(list(queries_with_qrels.items())[:max_queries])
+        else:
+            queries = queries_with_qrels
 
         logger.info(f"Generating budget training data for {len(queries)} queries")
 
@@ -189,6 +191,7 @@ class BudgetTrainingDataGenerator:
 
         for query_id, query_text in tqdm(queries.items(), desc="Processing queries"):
             if query_id not in qrels:
+                print(f"Skipping query {query_id}: no qrels")
                 continue  # Skip queries without relevance judgments
 
             try:
@@ -201,10 +204,16 @@ class BudgetTrainingDataGenerator:
                 )  # Shape: (10,)
 
                 # === 2. EXTRACT CANDIDATES (shared across all budgets) ===
+                # Check for KB override
+                kb_override = kb_candidates_map.get(query_id)
+                
                 candidates = self.candidate_extractor.extract_all_candidates(
                     query_text=query_text,
                     query_id=query_id,
+                    kb_override=kb_override
                 )
+                
+                print(f"Query {query_id}: Found {len(candidates)} candidates")
 
                 if not candidates:
                     logger.warning(f"No candidates for query {query_id}, skipping")
@@ -241,7 +250,13 @@ class BudgetTrainingDataGenerator:
                     logger.debug(f"Query {query_id}, budget={budget}, MAP={expanded_map:.4f}")
 
                 # === 4. FIND BEST BUDGET ===
-                best_budget = max(budget_scores, key=budget_scores.get)
+                # Add a small exploration bonus (0.0001) for higher budgets 
+                # to break ties or near-ties in favor of larger expansions.
+                budget_scores_with_bonus = {
+                    b: s + (i * 0.0001) 
+                    for i, (b, s) in enumerate(sorted(budget_scores.items()))
+                }
+                best_budget = max(budget_scores_with_bonus, key=budget_scores_with_bonus.get)
 
                 # Store training instance
                 query_features_list.append(query_features)
@@ -352,8 +367,10 @@ class BudgetTrainingDataGenerator:
                 qrels={query_id: qrels[query_id]}
             )
             map_score = metrics.get('map', 0.0)
+            ndcg_score = metrics.get('ndcg_cut_10', 0.0)
 
-            return float(map_score)
+            # Combined score (50% MAP, 50% nDCG)
+            return 0.5 * map_score + 0.5 * ndcg_score
 
         except Exception as e:
             logger.warning(f"Evaluation failed for query {query_id}: {e}", exc_info=True)
@@ -375,6 +392,8 @@ class BudgetTrainingDataGenerator:
             return 0.55
         else:
             return 0.55 - 0.02 * (n_terms - 10)
+
+from src.models.budget_predictor import BudgetPredictor, ConstantModel
 
 
 def train_budget_classifier(
@@ -409,7 +428,7 @@ def train_budget_classifier(
 
     # Split into train/validation
     X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
+        X, y, test_size=0.2, random_state=42
     )
 
     logger.info(f"Train: {len(X_train)}, Val: {len(X_val)}")
@@ -420,10 +439,52 @@ def train_budget_classifier(
 
     n_classes = len(class_to_budget)
 
-    if n_classes == 2:
-        objective = 'binary:logistic'
-    else:
-        objective = 'multi:softmax'
+    # RE-MAP y to be contiguous 0, 1, ... if not all classes are present
+    # but keep track for wrapped_model
+    unique_present, counts = np.unique(y_train, return_counts=True)
+    min_count = np.min(counts) if len(counts) > 0 else 0
+    
+    logger.info(f"Class distribution in train set: {dict(zip(unique_present, counts))}")
+
+    # Handle single-class or "effectively single-class" case
+    # If minority class has fewer than 10 samples, we can't reliably train/validate.
+    if len(unique_present) < 2 or min_count < 10:
+        logger.warning(f"Insufficient class diversity (unique={len(unique_present)}, min_count={min_count}).")
+        logger.warning("Falling back to ConstantModel.")
+        
+        # Pick the majority class from y_train
+        majority_class_idx = unique_present[np.argmax(counts)]
+
+        logger.warning(f"Insufficient class diversity (unique={len(unique_present)}, min_count={min_count}).")
+        logger.warning("Falling back to ConstantModel.")
+        
+        # Pick the majority class from y_train
+        majority_class_idx = unique_present[np.argmax(counts)]
+
+        # The constant value is the class index
+        model = ConstantModel(majority_class_idx, n_features=X_train.shape[1])
+        
+        wrapped_model = BudgetPredictor(model, class_to_budget)
+        
+        # Log dummy metrics
+        logger.info(f"Training accuracy: 1.0000 (Constant)")
+        # Accuracy on val set (which might contain the rare class)
+        val_preds = model.predict(X_val)
+        logger.info(f"Validation accuracy: {accuracy_score(y_val, val_preds):.4f}")
+        
+        # Save wrapped model
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        joblib.dump(wrapped_model, output_path)
+        logger.info(f"Budget model saved to {output_path}")
+
+        return wrapped_model
+
+    # Actually, we should use the same mapping as the overall data
+    # but XGBoost strictly wants [0, 1, ...] for some versions
+    
+    objective = 'multi:softmax' if n_classes > 2 else 'binary:logistic'
 
     model = xgb.XGBClassifier(
         n_estimators=n_estimators,
@@ -435,15 +496,49 @@ def train_budget_classifier(
         eval_metric='mlogloss' if n_classes > 2 else 'logloss',
     )
 
+    # Compute sample weights to handle class imbalance
+    from sklearn.utils.class_weight import compute_sample_weight
+    sample_weights = compute_sample_weight(class_weight='balanced', y=y_train)
+
+    # Re-map labels using LabelEncoder fitted on ALL data to handle missing classes in splits
+    from sklearn.preprocessing import LabelEncoder
+    le = LabelEncoder()
+    # Fit on all possible classes or at least all present in data
+    # Ideally should be consistent with budget_to_class keys 0,1,2
+    le.fit(y) 
+    
+    y_train_encoded = le.transform(y_train)
+    y_val_encoded = le.transform(y_val)
+    
+    # Update n_classes for the model
+    n_classes_present = len(le.classes_)
+    model.set_params(num_class=n_classes_present if n_classes_present > 2 else None)
+    model.set_params(objective='multi:softmax' if n_classes_present > 2 else 'binary:logistic')
+
     model.fit(
-        X_train, y_train,
-        eval_set=[(X_val, y_val)],
+        X_train, y_train_encoded,
+        sample_weight=sample_weights,
+        eval_set=[(X_val, y_val_encoded)],
         verbose=True,
     )
 
+    # Create remapped class_to_budget to account for LabelEncoder
+    remapped_class_to_budget = {
+        i: class_to_budget[le.classes_[i]]
+        for i in range(len(le.classes_))
+    }
+
+    # Wrap model with budget mapping
+    wrapped_model = BudgetPredictor(model, remapped_class_to_budget)
+
     # Evaluate
-    y_train_pred = model.predict(X_train)
-    y_val_pred = model.predict(X_val)
+    # predict() on XGBClassifier returns encoded labels [0...k-1]
+    y_train_encoded_pred = model.predict(X_train)
+    y_val_encoded_pred = model.predict(X_val)
+
+    # Decode back to original classes [0, 1, 2] for evaluation vs y_train/y_val
+    y_train_pred = le.inverse_transform(y_train_encoded_pred)
+    y_val_pred = le.inverse_transform(y_val_encoded_pred)
 
     train_acc = accuracy_score(y_train, y_train_pred)
     val_acc = accuracy_score(y_val, y_val_pred)
@@ -453,11 +548,19 @@ def train_budget_classifier(
 
     # Classification report
     logger.info("\nValidation Classification Report:")
-    report = classification_report(
-        y_val, y_val_pred,
-        target_names=[f"Budget {class_to_budget[i]}" for i in range(n_classes)]
-    )
-    logger.info(f"\n{report}")
+    unique_labels = sorted(list(set(y_val) | set(y_val_pred)))
+    target_names = [f"Budget {class_to_budget[i]}" for i in unique_labels]
+    
+    try:
+        report = classification_report(
+            y_val, y_val_pred,
+            labels=unique_labels,
+            target_names=target_names,
+            zero_division=0
+        )
+        logger.info(f"\n{report}")
+    except Exception as e:
+        logger.warning(f"Failed to generate classification report: {e}")
 
     # Feature importance
     importance = model.feature_importances_
@@ -471,25 +574,7 @@ def train_budget_classifier(
         fname = feature_names[idx] if idx < len(feature_names) else f"Feature {idx}"
         logger.info(f"  {i}. {fname}: {importance[idx]:.4f}")
 
-    # Wrap model with budget mapping
-    class BudgetPredictor:
-        """Wrapper that predicts actual budget values instead of class indices."""
-
-        def __init__(self, xgb_model, class_to_budget):
-            self.model = xgb_model
-            self.class_to_budget = class_to_budget
-
-        def predict(self, X):
-            """Predict budget values."""
-            class_preds = self.model.predict(X)
-            budget_preds = np.array([self.class_to_budget[int(c)] for c in class_preds])
-            return budget_preds
-
-        def predict_proba(self, X):
-            """Predict class probabilities."""
-            return self.model.predict_proba(X)
-
-    wrapped_model = BudgetPredictor(model, class_to_budget)
+    # Save wrapped model
 
     # Save wrapped model
     output_path = Path(output_path)
@@ -522,10 +607,14 @@ def main():
     # Optional extractors
     parser.add_argument("--kb-wat-output", type=str, default=None,
                         help="Path to WAT entity linking output (optional)")
+    parser.add_argument("--kb-candidates", type=str, default=None,
+                        help="Path to precomputed KB candidates JSONL (optional)")
     parser.add_argument("--kb-desc-tsv", type=str, default=None,
                         help="Path to wikiid->description TSV (optional)")
     parser.add_argument("--vocab-embeddings", type=str, default=None,
                         help="Path to vocabulary embeddings (optional)")
+    parser.add_argument("--llm-candidates", type=str, default=None,
+                        help="Path to LLM-generated candidates JSONL (optional)")
 
     # Output
     parser.add_argument("--output-dir", type=str, required=True,
@@ -547,6 +636,10 @@ def main():
     # Collection size
     parser.add_argument("--collection-size", type=int, default=8841823,
                         help="Collection size (default: MS MARCO passage)")
+    
+    # Lucene
+    parser.add_argument("--lucene-path", type=str, default="./lucene_jars",
+                        help="Path to Lucene JARs")
 
     args = parser.parse_args()
 
@@ -561,6 +654,10 @@ def main():
     # === INITIALIZE COMPONENTS ===
 
     logger.info("Initializing components...")
+    
+    # Initialize Lucene
+    from src.utils.lucene_utils import initialize_lucene
+    initialize_lucene(lucene_path=args.lucene_path)
 
     # Encoder
     encoder = SemanticEncoder(model_name="sentence-transformers/all-MiniLM-L6-v2")
@@ -600,17 +697,32 @@ def main():
         encoder=encoder,
         kb_extractor=kb_extractor,
         emb_extractor=emb_extractor,
+        llm_candidates_path=args.llm_candidates,
     )
 
     # === LOAD QUERIES AND QRELS ===
 
+    from scripts.run_msmeqe_evaluation import load_queries_from_file
+
     logger.info(f"Loading queries from {args.training_queries}")
-    queries = load_json(args.training_queries)
+    queries = load_queries_from_file(args.training_queries, args.max_queries)
 
     logger.info(f"Loading qrels from {args.qrels}")
     qrels = load_qrels(args.qrels)
 
     logger.info(f"Loaded {len(queries)} queries, {len(qrels)} qrels")
+
+    # Load KB candidates if provided
+    kb_candidates_map = None
+    if args.kb_candidates:
+        logger.info(f"Loading KB candidates from {args.kb_candidates}")
+        kb_candidates_map = {}
+        with open(args.kb_candidates, 'r') as f:
+            for line in f:
+                if not line.strip(): continue
+                item = json.loads(line)
+                kb_candidates_map[item['qid']] = item.get('candidates', [])
+        logger.info(f"Loaded candidates for {len(kb_candidates_map)} queries")
 
     # === GENERATE TRAINING DATA ===
 
@@ -628,11 +740,17 @@ def main():
 
     training_data_path = output_dir / "budget_training_data.pkl"
 
+    # Always regenerate or check flag? We want to regenerate for KB.
+    if training_data_path.exists():
+        logger.warning(f"Removing existing training data at {training_data_path} to ensure KB integration")
+        training_data_path.unlink()
+
     generator.generate_training_data(
         queries=queries,
         qrels=qrels,
         output_path=str(training_data_path),
         max_queries=args.max_queries,
+        kb_candidates_map=kb_candidates_map
     )
 
     # === TRAIN MODEL ===

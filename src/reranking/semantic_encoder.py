@@ -29,6 +29,7 @@ class SemanticEncoder:
         """
         logger.info(f"Loading SemanticEncoder model: {model_name}")
         self.model = SentenceTransformer(model_name, device=device)
+        self.model_name = model_name
         self.batch_size = batch_size
 
     # -------------------------

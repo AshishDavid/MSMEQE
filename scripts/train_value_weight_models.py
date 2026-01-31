@@ -48,7 +48,7 @@ VALUE_FEATURE_NAMES = [
     'bm25_delta', 'clarity_delta',  # Retrieval
     'source_docs', 'source_kb', 'source_emb',  # Source
     'native_rank_norm', 'native_score',
-    'extra_feature_17'  # Padding if needed
+    'is_llm', 'agreement_count'  # New features
 ]
 
 WEIGHT_FEATURE_NAMES = [
@@ -144,6 +144,7 @@ def train_value_model(
                     f"learning_rate={learning_rate}, alpha={reg_alpha}, lambda={reg_lambda}")
 
         model = xgb.XGBRegressor(
+            n_jobs=1,
             n_estimators=n_estimators,
             max_depth=max_depth,
             learning_rate=learning_rate,
@@ -151,13 +152,12 @@ def train_value_model(
             reg_lambda=reg_lambda,
             objective='reg:squarederror',
             random_state=42,
-            n_jobs=-1,
+            eval_metric=['rmse', 'mae'],
         )
 
         model.fit(
             X_train, y_train,
             eval_set=[(X_train, y_train), (X_val, y_val)],
-            eval_metric=['rmse', 'mae'],
             verbose=False,
         )
 
@@ -171,7 +171,7 @@ def train_value_model(
 
     # Training metrics
     train_r2 = r2_score(y_train, y_train_pred)
-    train_rmse = mean_squared_error(y_train, y_train_pred, squared=False)
+    train_rmse = np.sqrt(mean_squared_error(y_train, y_train_pred))
     train_mae = mean_absolute_error(y_train, y_train_pred)
 
     logger.info(f"\nTraining Metrics:")
@@ -181,7 +181,7 @@ def train_value_model(
 
     # Validation metrics
     val_r2 = r2_score(y_val, y_val_pred)
-    val_rmse = mean_squared_error(y_val, y_val_pred, squared=False)
+    val_rmse = np.sqrt(mean_squared_error(y_val, y_val_pred))
     val_mae = mean_absolute_error(y_val, y_val_pred)
 
     logger.info(f"\nValidation Metrics:")
@@ -304,6 +304,7 @@ def train_weight_model(
                     f"learning_rate={learning_rate}, alpha={reg_alpha}, lambda={reg_lambda}")
 
         model = xgb.XGBRegressor(
+            n_jobs=1,
             n_estimators=n_estimators,
             max_depth=max_depth,
             learning_rate=learning_rate,
@@ -311,13 +312,12 @@ def train_weight_model(
             reg_lambda=reg_lambda,
             objective='reg:squarederror',
             random_state=42,
-            n_jobs=-1,
+            eval_metric=['rmse', 'mae'],
         )
 
         model.fit(
             X_train, y_train,
             eval_set=[(X_train, y_train), (X_val, y_val)],
-            eval_metric=['rmse', 'mae'],
             verbose=False,
         )
 
@@ -331,7 +331,7 @@ def train_weight_model(
 
     # Training metrics
     train_r2 = r2_score(y_train, y_train_pred)
-    train_rmse = mean_squared_error(y_train, y_train_pred, squared=False)
+    train_rmse = np.sqrt(mean_squared_error(y_train, y_train_pred))
     train_mae = mean_absolute_error(y_train, y_train_pred)
 
     logger.info(f"\nTraining Metrics:")
@@ -341,7 +341,7 @@ def train_weight_model(
 
     # Validation metrics
     val_r2 = r2_score(y_val, y_val_pred)
-    val_rmse = mean_squared_error(y_val, y_val_pred, squared=False)
+    val_rmse = np.sqrt(mean_squared_error(y_val, y_val_pred))
     val_mae = mean_absolute_error(y_val, y_val_pred)
 
     logger.info(f"\nValidation Metrics:")
